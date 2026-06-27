@@ -200,3 +200,4 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Не найден DISCORD_TOKEN. Заполните файл .env (см. .env.example).")
     asyncio.run(bot.start(TOKEN))
+
