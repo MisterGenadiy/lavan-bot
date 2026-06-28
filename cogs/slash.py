@@ -71,6 +71,27 @@ async def duration_autocomplete(interaction: discord.Interaction, current: str):
     ][:25]
 
 
+async def backup_id_autocomplete(interaction: discord.Interaction, current: str):
+    """Подсказки ID бэкапов сервера — от новых к старым, с датой создания
+    и пометкой [авто], если это emergency-бэкап перед прошлым restore.
+    Без этого пользователю нужно было бы помнить/копировать ID вручную."""
+    ids = list(reversed(backup_core.list_backups(interaction.guild.id)))
+    choices = []
+    for backup_id in ids:
+        if current and current.lower() not in backup_id.lower():
+            continue
+        info = backup_core.get_backup_info(interaction.guild.id, backup_id)
+        if info is None:
+            continue
+        label = f"{backup_id} — {info['created_at']}"
+        if info.get("is_emergency"):
+            label += " [авто перед restore]"
+        choices.append(app_commands.Choice(name=label[:100], value=backup_id))
+        if len(choices) >= 25:  # лимит Discord на количество вариантов автодополнения
+            break
+    return choices
+
+
 class IgnoreSpamGroup(app_commands.Group):
     def __init__(self, bot):
         super().__init__(name="ignore-spam", description="Каналы, игнорируемые антиспамом/антилинком")
@@ -163,12 +184,20 @@ class RestoreConfirmView(discord.ui.View):
     К моменту показа кнопок план уже построен и показан пользователю (см. /load) —
     кнопка "Подтвердить" применяет именно его область восстановления."""
 
-    def __init__(self, guild: discord.Guild, author_id: int, scope: RestoreScope, remove_extra: bool):
+    def __init__(
+        self,
+        guild: discord.Guild,
+        author_id: int,
+        scope: RestoreScope,
+        remove_extra: bool,
+        backup_id: str | None = None,
+    ):
         super().__init__(timeout=30)
         self.guild = guild
         self.author_id = author_id
         self.scope = scope
         self.remove_extra = remove_extra
+        self.backup_id = backup_id
         self.confirmed = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -189,8 +218,12 @@ class RestoreConfirmView(discord.ui.View):
             pass
 
         try:
+            progress_cb = backup_core.make_throttled_progress_callback(
+                lambda text: interaction.edit_original_response(content=text)
+            )
             _plan, result, emergency_id = await backup_core.restore_with_safety(
-                self.guild, scope=self.scope, remove_extra=self.remove_extra
+                self.guild, backup_id=self.backup_id, scope=self.scope, remove_extra=self.remove_extra,
+                progress_cb=progress_cb,
             )
             content = (
                 f"✅ Восстановление завершено: создано {result.total_created()}, "
@@ -641,8 +674,10 @@ class SlashCommands(commands.Cog):
     @app_commands.describe(
         область="Что восстанавливать — по умолчанию всё",
         удалять_лишнее="Удалять то, чего нет в бэкапе (роли/каналы) — по умолчанию выключено",
+        бэкап="Какой бэкап использовать — по умолчанию последний",
     )
     @app_commands.choices(область=SCOPE_CHOICES)
+    @app_commands.autocomplete(бэкап=backup_id_autocomplete)
     @app_commands.checks.cooldown(1, 30, key=lambda i: i.guild_id)
     @mod_check()
     async def load(
@@ -650,6 +685,7 @@ class SlashCommands(commands.Cog):
         interaction: discord.Interaction,
         область: app_commands.Choice[str] = None,
         удалять_лишнее: bool = False,
+        бэкап: str = None,
     ):
         if not backup_core.has_backup(interaction.guild.id):
             return await interaction.response.send_message(
@@ -661,7 +697,7 @@ class SlashCommands(commands.Cog):
 
         await interaction.response.defer()
         try:
-            plan = backup_core.build_plan(interaction.guild, scope=scope, remove_extra=удалять_лишнее)
+            plan = backup_core.build_plan(interaction.guild, бэкап, scope=scope, remove_extra=удалять_лишнее)
         except FileNotFoundError:
             return await interaction.followup.send("⚠️ Бэкап не найден.")
 
@@ -671,13 +707,102 @@ class SlashCommands(commands.Cog):
                 "Текущее состояние сервера уже совпадает с бэкапом — изменений не требуется.", embed=embed
             )
 
-        view = RestoreConfirmView(interaction.guild, interaction.user.id, scope, удалять_лишнее)
+        view = RestoreConfirmView(interaction.guild, interaction.user.id, scope, удалять_лишнее, backup_id=бэкап)
         await interaction.followup.send(
             "⚠️ Перед восстановлением будет автоматически создан резервный бэкап текущего состояния. "
             "Подтвердите применение плана выше:",
             embed=embed,
             view=view,
         )
+
+    @app_commands.command(name="backups", description="Посмотреть список сохранённых бэкапов этого сервера")
+    @mod_check()
+    async def backups_list(self, interaction: discord.Interaction):
+        ids = list(reversed(backup_core.list_backups(interaction.guild.id)))
+        if not ids:
+            return await interaction.response.send_message("Бэкапов для этого сервера пока нет.", ephemeral=True)
+
+        lines = []
+        for backup_id in ids[:25]:  # лимит на длину embed-поля — see build_restore_plan_embed для аналогичной логики
+            info = backup_core.get_backup_info(interaction.guild.id, backup_id)
+            if info is None:
+                continue
+            mark = " 🛟 (авто перед restore)" if info.get("is_emergency") else ""
+            lines.append(f"`{backup_id}` — {info['created_at']}{mark}\n{info['roles']} ролей, {info['channels']} каналов")
+        embed = discord.Embed(
+            title=f"📦 Бэкапы сервера «{interaction.guild.name}»",
+            description="\n\n".join(lines) or "—",
+            color=discord.Color.blurple(),
+        )
+        if len(ids) > 25:
+            embed.set_footer(text=f"Показаны последние 25 из {len(ids)}.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="rollback", description="Откатиться к авто-бэкапу, сделанному перед последним восстановлением"
+    )
+    @app_commands.describe(бэкап="Конкретный бэкап для отката — по умолчанию последний emergency-бэкап")
+    @app_commands.autocomplete(бэкап=backup_id_autocomplete)
+    @app_commands.checks.cooldown(1, 30, key=lambda i: i.guild_id)
+    @mod_check()
+    async def rollback(self, interaction: discord.Interaction, бэкап: str = None):
+        target_id = бэкап or backup_core.latest_emergency_backup_id(interaction.guild.id)
+        if target_id is None:
+            return await interaction.response.send_message(
+                "⚠️ Не найдено ни одного авто-бэкапа перед restore — откатываться не к чему. "
+                "Используйте `/load` с конкретным `бэкап`, если хотите восстановиться к произвольному снимку.",
+                ephemeral=True,
+            )
+
+        scope = RestoreScope.all()
+        await interaction.response.defer()
+        try:
+            # remove_extra=True — смысл rollback именно в полном возврате к прежнему состоянию,
+            # а не в частичном "доливании" отсутствующего, как при обычном /load.
+            plan = backup_core.build_plan(interaction.guild, target_id, scope=scope, remove_extra=True)
+        except FileNotFoundError:
+            return await interaction.followup.send("⚠️ Указанный бэкап не найден.")
+
+        embed = build_restore_plan_embed(plan, interaction.guild.name)
+        if plan.is_empty:
+            return await interaction.followup.send(
+                f"Текущее состояние сервера уже совпадает с бэкапом `{target_id}` — откатывать нечего.", embed=embed
+            )
+
+        view = RestoreConfirmView(interaction.guild, interaction.user.id, scope, True, backup_id=target_id)
+        await interaction.followup.send(
+            f"⚠️ Откат к бэкапу `{target_id}`. Перед применением будет создан ещё один резервный бэкап "
+            "текущего состояния (на случай, если и откат окажется ошибкой). Подтвердите применение плана выше:",
+            embed=embed,
+            view=view,
+        )
+
+    @app_commands.command(
+        name="find-duplicates", description="Найти роли/каналы/категории с одинаковыми именами на сервере"
+    )
+    @mod_check()
+    async def find_duplicates(self, interaction: discord.Interaction):
+        groups = backup_core.find_duplicates(interaction.guild)
+        if not groups:
+            return await interaction.response.send_message(
+                "✅ Дубликатов по именам не найдено — ролям и каналам можно безопасно сопоставляться с бэкапом.",
+                ephemeral=True,
+            )
+
+        labels = {"role": "Роль", "category": "Категория", "channel": "Канал"}
+        lines = [f"**{labels.get(g.kind, g.kind)}** «{g.name}» — {len(g.ids)} шт. ({', '.join(str(i) for i in g.ids)})" for g in groups]
+        embed = discord.Embed(
+            title="⚠️ Найдены дубликаты имён",
+            description=(
+                "Восстановление из бэкапа сопоставляет сущности по имени, а не по Discord ID — "
+                "из-за этих дубликатов соответствующие элементы будут помечены конфликтом и пропущены "
+                "при `/load`. Рекомендуется переименовать или удалить лишние вручную.\n\n" + "\n".join(lines[:25])
+            ),
+            color=discord.Color.orange(),
+        )
+        if len(lines) > 25:
+            embed.set_footer(text=f"Показаны первые 25 из {len(lines)} групп.")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot):

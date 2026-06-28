@@ -10,12 +10,17 @@
   вызывающему коду, чтобы при необходимости откатиться (rollback) — то есть
   выполнить ещё один restore с этим backup_id и scope=ALL.
 - Ошибки Discord API по каждой сущности не прерывают весь процесс — одна
-  неудачная роль/канал не должна обрушивать восстановление остальных сотен."""
+  неудачная роль/канал не должна обрушивать восстановление остальных сотен.
+- На больших серверах (сотни ролей/каналов) применение плана может занимать
+  заметное время — apply_plan поддерживает progress_cb(done, total) для
+  показа прогресса пользователю, не дожидаясь полного завершения."""
 
 from __future__ import annotations
 
 import base64
+import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 import discord
 
@@ -37,6 +42,8 @@ from .models import (
     RestoreScope,
 )
 from .retry import with_retry
+
+ProgressCallback = Callable[[int, int], Awaitable[None]]
 
 _VERIFICATION_LEVELS = {lvl.name: lvl for lvl in discord.VerificationLevel}
 _CONTENT_FILTERS = {f.name: f for f in discord.ContentFilter}
@@ -270,18 +277,24 @@ async def _apply_guild_settings(guild: discord.Guild, item: PlanItem, result: Re
         result.errors.append(f"Настройки сервера: {e}")
 
 
-async def apply_plan(guild: discord.Guild, plan: RestorePlan) -> RestoreResult:
+async def apply_plan(guild: discord.Guild, plan: RestorePlan, *, progress_cb: ProgressCallback | None = None) -> RestoreResult:
     """Применяет план. Порядок важен: роли -> категории -> каналы -> эмодзи/стикеры
     -> настройки сервера, иначе permission overwrites не на что будет ссылаться
-    (роль для overwrite должна существовать до создания канала)."""
+    (роль для overwrite должна существовать до создания канала).
+
+    progress_cb(done, total), если передан, вызывается после каждого пункта плана —
+    на больших серверах (сотни ролей/каналов) восстановление может идти минуты,
+    и пользователю важно видеть, что процесс не "завис". Ошибка внутри
+    progress_cb (например, Discord отверг слишком частый edit сообщения)
+    не должна прерывать само восстановление — поэтому она проглатывается."""
     result = RestoreResult()
     name_to_category: dict[str, discord.CategoryChannel] = {c.name: c for c in guild.categories}
+    total = len(plan.items)
 
-    for item in plan.items:
+    for done, item in enumerate(plan.items, start=1):
         if item.action == ACTION_CONFLICT:
             result.skipped_conflicts += 1
-            continue
-        if item.kind == KIND_ROLE:
+        elif item.kind == KIND_ROLE:
             await _apply_role(guild, item, result)
         elif item.kind == KIND_CATEGORY:
             await _apply_category(guild, item, result, name_to_category)
@@ -294,7 +307,34 @@ async def apply_plan(guild: discord.Guild, plan: RestorePlan) -> RestoreResult:
         elif item.kind == KIND_GUILD_SETTINGS:
             await _apply_guild_settings(guild, item, result)
 
+        if progress_cb is not None:
+            try:
+                await progress_cb(done, total)
+            except Exception:
+                pass
+
     return result
+
+
+def make_throttled_progress_callback(edit_func: Callable[[str], Awaitable[None]], *, min_interval: float = 4.0):
+    """Оборачивает edit_func (например, status_message.edit или
+    interaction.edit_original_response) в progress_cb, который реально шлёт
+    запрос в Discord не чаще, чем раз в min_interval секунд — иначе на каждую
+    из сотен ролей/каналов улетал бы отдельный edit и упёрся бы в rate limit
+    Discord. Последний пункт плана (done == total) обновляется всегда,
+    независимо от таймера, чтобы финальное сообщение не зависло на 80%."""
+    state = {"last": float("-inf")}  # -inf гарантирует, что первый вызов всегда пройдёт,
+    # независимо от абсолютного значения time.monotonic() в конкретной системе/контейнере
+
+    async def progress_cb(done: int, total: int):
+        now = time.monotonic()
+        if done < total and now - state["last"] < min_interval:
+            return
+        state["last"] = now
+        percent = int(done / total * 100) if total else 100
+        await edit_func(f"⏳ Применяется план восстановления: {done}/{total} ({percent}%)...")
+
+    return progress_cb
 
 
 async def create_emergency_backup(guild: discord.Guild) -> str:
@@ -302,7 +342,9 @@ async def create_emergency_backup(guild: discord.Guild) -> str:
     к rollback: если /load что-то испортит, этим backup_id можно воспользоваться
     как обычным бэкапом и восстановиться обратно тем же механизмом."""
     data = await capture.capture_guild(guild, is_emergency=True, note="Авто-бэкап перед восстановлением")
-    return storage.save(data)
+    backup_id = storage.save(data)
+    storage.prune_old_backups(guild.id)
+    return backup_id
 
 
 async def restore_with_safety(
@@ -312,11 +354,12 @@ async def restore_with_safety(
     scope: RestoreScope = RestoreScope.all(),
     remove_extra: bool = False,
     skip_emergency_backup: bool = False,
+    progress_cb: ProgressCallback | None = None,
 ) -> tuple[RestorePlan, RestoreResult, str | None]:
     """Полный безопасный цикл восстановления:
     1) emergency-бэкап текущего состояния (если не отключён явно);
     2) построение плана (что изменится);
-    3) применение плана.
+    3) применение плана (с опциональным progress_cb для прогресса на больших серверах).
 
     Возвращает (план, результат, id emergency-бэкапа или None)."""
     target_id = backup_id or storage.latest_backup_id(guild.id)
@@ -327,7 +370,7 @@ async def restore_with_safety(
     emergency_id = None if skip_emergency_backup else await create_emergency_backup(guild)
 
     plan = diff_build_plan(guild, backup, scope=scope, remove_extra=remove_extra)
-    result = await apply_plan(guild, plan)
+    result = await apply_plan(guild, plan, progress_cb=progress_cb)
     return plan, result, emergency_id
 
 

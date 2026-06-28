@@ -64,8 +64,13 @@ class Help(commands.Cog):
             name="💾 Бэкап",
             value=(
                 f"`{prefix}backup save` — сохранить структуру сервера\n"
-                f"`{prefix}backup restore` — восстановить из бэкапа\n"
-                f"`{prefix}backup info` — информация о последнем бэкапе"
+                f"`{prefix}backup restore [область] [safe|strict]` — восстановить из бэкапа "
+                "(показывает план изменений и требует подтверждения; область: all/roles/channels/categories/permissions)\n"
+                f"`{prefix}backup rollback [id]` — откатиться к авто-бэкапу перед последним restore\n"
+                f"`{prefix}backup info` — информация о последнем бэкапе\n"
+                f"`{prefix}backup list` — список всех сохранённых бэкапов\n"
+                f"`{prefix}backup duplicates` — найти роли/каналы с одинаковыми именами\n"
+                "Также доступно как слэш-команды: `/save`, `/load`, `/rollback`, `/backups`, `/find-duplicates`."
             ),
             inline=False,
         )

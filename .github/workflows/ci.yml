@@ -1,0 +1,41 @@
+name: CI
+
+# Простая проверка на каждый push/PR: ставится Python нужной версии,
+# устанавливаются зависимости, проверяется, что все .py-файлы хотя бы
+# компилируются (py_compile), и прогоняются юнит-тесты utils/backup_core
+# (см. tests/). Цель — не дать синтаксической ошибке или регрессии в
+# логике сравнения/восстановления бэкапов уйти в main незамеченной.
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Установить Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Установить зависимости
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Проверка синтаксиса (py_compile)
+        run: |
+          python -m py_compile $(git ls-files '*.py')
+
+      - name: Юнит-тесты (utils/backup_core)
+        run: |
+          pytest -q

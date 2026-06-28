@@ -121,6 +121,20 @@ def latest_backup_id(guild_id: int) -> str | None:
     return None
 
 
+def latest_emergency_backup_id(guild_id: int) -> str | None:
+    """Последний по времени emergency-бэкап (автоматически созданный перед
+    restore) — то, что используется командой rollback по умолчанию, если
+    backup_id не указан явно."""
+    for backup_id in reversed(list_backups(guild_id)):
+        try:
+            data = load(guild_id, backup_id)
+        except (OSError, ValueError, KeyError):
+            continue
+        if data.metadata.is_emergency:
+            return backup_id
+    return None
+
+
 def load(guild_id: int, backup_id: str) -> BackupData:
     if backup_id == f"legacy-{guild_id}" and not os.path.exists(_backup_path(guild_id, backup_id)):
         with open(_legacy_path(guild_id), encoding="utf-8") as f:
@@ -140,3 +154,40 @@ def load_latest(guild_id: int) -> BackupData | None:
     if backup_id is None:
         return None
     return load(guild_id, backup_id)
+
+
+# Сколько бэкапов хранить по умолчанию. Обычные и emergency считаются
+# раздельно — иначе серия restore-операций (каждая создаёт emergency-бэкап)
+# могла бы вымыть единственный "настоящий" бэкап сервера, сделанный руками.
+MAX_REGULAR_BACKUPS = 10
+MAX_EMERGENCY_BACKUPS = 5
+
+
+def prune_old_backups(
+    guild_id: int, *, keep_regular: int = MAX_REGULAR_BACKUPS, keep_emergency: int = MAX_EMERGENCY_BACKUPS
+) -> int:
+    """Удаляет старые бэкапы сверх лимита (legacy-файл не трогает — он не
+    участвует в нумерации и его всего один). Возвращает количество удалённых файлов.
+
+    Вызывается автоматически после каждого save() — то есть после обычного
+    /save и после каждого emergency-бэкапа перед restore — так что лимит
+    держится сам по себе, без отдельной команды очистки."""
+    ids = list_backups(guild_id)  # от старых к новым
+    regular, emergency = [], []
+    for backup_id in ids:
+        try:
+            data = load(guild_id, backup_id)
+        except (OSError, ValueError, KeyError):
+            continue  # повреждённый/нечитаемый файл — не учитываем в ретеншене, не удаляем сам по себе
+        (emergency if data.metadata.is_emergency else regular).append(backup_id)
+
+    removed = 0
+    for bucket, keep in ((regular, keep_regular), (emergency, keep_emergency)):
+        excess = bucket[: max(0, len(bucket) - keep)]
+        for backup_id in excess:
+            try:
+                os.remove(_backup_path(guild_id, backup_id))
+                removed += 1
+            except OSError:
+                pass
+    return removed

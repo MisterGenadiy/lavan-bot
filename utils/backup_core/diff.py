@@ -14,6 +14,8 @@ recreate ID всё равно меняются, так что сопоставл
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import discord
 
 from .models import (
@@ -374,3 +376,43 @@ def build_plan(guild: discord.Guild, backup: BackupData, *, scope: RestoreScope,
         items = [i for i in items if i.action != ACTION_REMOVE]
 
     return RestorePlan(backup_id=backup.metadata.backup_id, scope=scope, remove_extra=remove_extra, items=items)
+
+
+@dataclass
+class DuplicateGroup:
+    """Несколько сущностей сервера с одинаковым именем — то, что мешает
+    сопоставлению по имени при restore (см. модуль docstring выше) и обычно
+    само по себе является мусором, накопившимся за время жизни сервера."""
+
+    kind: str
+    name: str
+    ids: list[int]
+
+
+def find_duplicate_entities(guild: discord.Guild) -> list[DuplicateGroup]:
+    """Сканирует сервер (без какого-либо бэкапа) и находит роли/категории/каналы
+    с повторяющимися именами — те самые группы, которые build_plan() выше
+    помечает как ACTION_CONFLICT и пропускает. Отдельная команда удобнее:
+    не нужно иметь бэкап, чтобы просто посмотреть, что на сервере задвоено."""
+    groups: list[DuplicateGroup] = []
+
+    roles_by_name = _group_by_name([r for r in guild.roles if not r.is_default() and not r.managed], key=lambda r: r.name)
+    for name, roles in roles_by_name.items():
+        if len(roles) > 1:
+            groups.append(DuplicateGroup(kind=KIND_ROLE, name=name, ids=[r.id for r in roles]))
+
+    categories_by_name = _group_by_name(guild.categories, key=lambda c: c.name)
+    for name, cats in categories_by_name.items():
+        if len(cats) > 1:
+            groups.append(DuplicateGroup(kind=KIND_CATEGORY, name=name, ids=[c.id for c in cats]))
+
+    live_channels = [c for c in guild.channels if not isinstance(c, discord.CategoryChannel)]
+    channels_by_key = _group_by_name(
+        live_channels, key=lambda c: _channel_key(c.name, c.category.name if c.category else None)
+    )
+    for (category_name, name), chans in channels_by_key.items():
+        if len(chans) > 1:
+            label = f"{name} (в категории «{category_name}»)" if category_name else name
+            groups.append(DuplicateGroup(kind=KIND_CHANNEL, name=label, ids=[c.id for c in chans]))
+
+    return groups

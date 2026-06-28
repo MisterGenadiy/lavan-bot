@@ -17,8 +17,9 @@ import discord
 
 from . import capture, diff, storage
 from .models import BackupData, PlanItem, RestorePlan, RestoreScope
+from .diff import DuplicateGroup, find_duplicate_entities
 from .notify import notify_guild_or_dm
-from .restore import RestoreResult, apply_plan, create_emergency_backup, restore_with_safety
+from .restore import RestoreResult, apply_plan, create_emergency_backup, make_throttled_progress_callback, restore_with_safety
 
 __all__ = [
     "save_backup",
@@ -31,13 +32,30 @@ __all__ = [
     "create_emergency_backup",
     "restore_with_safety",
     "restore_backup",
+    "latest_emergency_backup_id",
+    "find_duplicates",
     "notify_guild_or_dm",
+    "make_throttled_progress_callback",
     "RestoreScope",
     "RestorePlan",
     "RestoreResult",
     "PlanItem",
     "BackupData",
+    "DuplicateGroup",
 ]
+
+
+def find_duplicates(guild: discord.Guild) -> list[DuplicateGroup]:
+    """Роли/категории/каналы с повторяющимися именами — отдельно от restore,
+    без необходимости иметь бэкап. Именно такие дубликаты build_plan() не
+    может сопоставить однозначно и помечает конфликтом при восстановлении."""
+    return find_duplicate_entities(guild)
+
+
+def latest_emergency_backup_id(guild_id: int) -> str | None:
+    """ID последнего автоматического бэкапа перед restore — то, к чему
+    откатывается команда rollback по умолчанию, если ID не указан явно."""
+    return storage.latest_emergency_backup_id(guild_id)
 
 
 async def save_backup(guild: discord.Guild) -> dict:
@@ -47,6 +65,7 @@ async def save_backup(guild: discord.Guild) -> dict:
     сохранены, так что код, читающий только их, продолжает работать."""
     data = await capture.capture_guild(guild)
     storage.save(data)
+    storage.prune_old_backups(guild.id)  # держим только последние N бэкапов — см. storage.MAX_REGULAR_BACKUPS
     counts = dict(data.metadata.counts)
     counts.setdefault("roles", len(data.roles))
     counts.setdefault("channels", len(data.channels) + len(data.categories))
