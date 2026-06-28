@@ -9,7 +9,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from utils import backup_core
-from utils.embeds import build_settings_embed
+from utils.backup_core.models import RestoreScope
+from utils.embeds import build_restore_plan_embed, build_settings_embed
 from utils.moderation_utils import add_warn_and_escalate, bot_can_moderate, send_mod_log
 
 
@@ -158,12 +159,16 @@ class WarnActionsGroup(app_commands.Group):
 
 
 class RestoreConfirmView(discord.ui.View):
-    """Кнопки подтверждения для /load, чтобы не восстанавливать сервер случайно."""
+    """Кнопки подтверждения для /load, чтобы не восстанавливать сервер случайно.
+    К моменту показа кнопок план уже построен и показан пользователю (см. /load) —
+    кнопка "Подтвердить" применяет именно его область восстановления."""
 
-    def __init__(self, guild: discord.Guild, author_id: int):
+    def __init__(self, guild: discord.Guild, author_id: int, scope: RestoreScope, remove_extra: bool):
         super().__init__(timeout=30)
         self.guild = guild
         self.author_id = author_id
+        self.scope = scope
+        self.remove_extra = remove_extra
         self.confirmed = False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -177,13 +182,25 @@ class RestoreConfirmView(discord.ui.View):
         self.confirmed = True
         self.stop()
         try:
-            await interaction.response.edit_message(content="⏳ Восстановление начато...", view=None)
+            await interaction.response.edit_message(
+                content="⏳ Создаётся резервный бэкап и применяется восстановление...", embed=None, view=None
+            )
         except discord.HTTPException:
             pass
 
         try:
-            counts = await backup_core.restore_backup(self.guild)
-            content = f"✅ Восстановление завершено: {counts['roles']} ролей, {counts['channels']} каналов."
+            _plan, result, emergency_id = await backup_core.restore_with_safety(
+                self.guild, scope=self.scope, remove_extra=self.remove_extra
+            )
+            content = (
+                f"✅ Восстановление завершено: создано {result.total_created()}, "
+                f"обновлено {result.total_updated()}, удалено {result.total_removed()}.\n"
+                f"Пропущено конфликтов: {result.skipped_conflicts}."
+            )
+            if result.errors:
+                content += f"\n⚠️ Ошибок: {len(result.errors)} (первая: {result.errors[0]})"
+            if emergency_id:
+                content += f"\n🛟 Резервный бэкап на случай отката: `{emergency_id}` (его можно загрузить через /load)."
         except FileNotFoundError:
             content = "⚠️ Бэкап не найден."
         except discord.HTTPException as e:
@@ -196,7 +213,7 @@ class RestoreConfirmView(discord.ui.View):
     @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.stop()
-        await interaction.response.edit_message(content="Восстановление отменено.", view=None)
+        await interaction.response.edit_message(content="Восстановление отменено.", embed=None, view=None)
 
 
 class SlashCommands(commands.Cog):
@@ -600,6 +617,14 @@ class SlashCommands(commands.Cog):
 
     # ---------------- Бэкап ----------------
 
+    SCOPE_CHOICES = [
+        app_commands.Choice(name="всё", value="all"),
+        app_commands.Choice(name="только роли", value="roles"),
+        app_commands.Choice(name="только каналы", value="channels"),
+        app_commands.Choice(name="только категории", value="categories"),
+        app_commands.Choice(name="только права доступа", value="permissions"),
+    ]
+
     @app_commands.command(name="save", description="Сохранить структуру сервера в файл")
     @app_commands.checks.cooldown(1, 30, key=lambda i: i.guild_id)
     @mod_check()
@@ -607,20 +632,50 @@ class SlashCommands(commands.Cog):
         await interaction.response.defer()
         counts = await backup_core.save_backup(interaction.guild)
         await interaction.followup.send(
-            f"💾 Бэкап сохранён: {counts['roles']} ролей, {counts['channels']} каналов/категорий."
+            f"💾 Бэкап сохранён (`{counts.get('backup_id', '?')}`): "
+            f"{counts['roles']} ролей, {counts.get('categories', 0)} категорий, "
+            f"{counts['channels']} каналов, {counts.get('emojis', 0)} эмодзи, {counts.get('stickers', 0)} стикеров."
         )
 
     @app_commands.command(name="load", description="Восстановить сервер из файла бэкапа")
+    @app_commands.describe(
+        область="Что восстанавливать — по умолчанию всё",
+        удалять_лишнее="Удалять то, чего нет в бэкапе (роли/каналы) — по умолчанию выключено",
+    )
+    @app_commands.choices(область=SCOPE_CHOICES)
     @app_commands.checks.cooldown(1, 30, key=lambda i: i.guild_id)
     @mod_check()
-    async def load(self, interaction: discord.Interaction):
+    async def load(
+        self,
+        interaction: discord.Interaction,
+        область: app_commands.Choice[str] = None,
+        удалять_лишнее: bool = False,
+    ):
         if not backup_core.has_backup(interaction.guild.id):
             return await interaction.response.send_message(
                 "⚠️ Бэкап не найден. Сначала выполните `/save`.", ephemeral=True
             )
-        view = RestoreConfirmView(interaction.guild, interaction.user.id)
-        await interaction.response.send_message(
-            "⚠️ Восстановление **удалит текущие роли и каналы** и создаст их заново из бэкапа. Подтвердите действие:",
+
+        scope_keyword = область.value if область else "all"
+        scope = RestoreScope.from_keyword(scope_keyword)
+
+        await interaction.response.defer()
+        try:
+            plan = backup_core.build_plan(interaction.guild, scope=scope, remove_extra=удалять_лишнее)
+        except FileNotFoundError:
+            return await interaction.followup.send("⚠️ Бэкап не найден.")
+
+        embed = build_restore_plan_embed(plan, interaction.guild.name)
+        if plan.is_empty:
+            return await interaction.followup.send(
+                "Текущее состояние сервера уже совпадает с бэкапом — изменений не требуется.", embed=embed
+            )
+
+        view = RestoreConfirmView(interaction.guild, interaction.user.id, scope, удалять_лишнее)
+        await interaction.followup.send(
+            "⚠️ Перед восстановлением будет автоматически создан резервный бэкап текущего состояния. "
+            "Подтвердите применение плана выше:",
+            embed=embed,
             view=view,
         )
 

@@ -2,6 +2,95 @@
 
 import discord
 
+from utils.backup_core.models import RestorePlan
+
+_KIND_LABELS = {
+    "role": "Роль",
+    "category": "Категория",
+    "channel": "Канал",
+    "emoji": "Эмодзи",
+    "sticker": "Стикер",
+    "guild_settings": "Настройки сервера",
+}
+
+_MAX_LINES_PER_FIELD = 12
+_FIELD_VALUE_LIMIT = 1024  # жёсткий лимит Discord на длину value у поля embed'а
+
+
+def _truncate(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _format_items(items, *, with_details: bool = False) -> str:
+    """Список пунктов плана в одно поле embed'а, гарантированно укладывающийся
+    в лимит Discord (1024 символа на value) — раньше это не проверялось,
+    и /load падал с `Invalid Form Body` на серверах с длинными описаниями
+    конфликтов или большим количеством каналов/ролей."""
+    if not items:
+        return "—"
+
+    # Резервируем место под завершающую строку "… и ещё N." — она добавляется
+    # либо потому что строк больше, чем _MAX_LINES_PER_FIELD, либо потому что
+    # мы упёрлись в лимит символов раньше.
+    budget = _FIELD_VALUE_LIMIT - 24
+
+    lines: list[str] = []
+    used = 0
+    for item in items[:_MAX_LINES_PER_FIELD]:
+        label = _KIND_LABELS.get(item.kind, item.kind)
+        line = f"**{label}** «{item.name}»"
+        if with_details and item.details:
+            line += f" — {item.details}"
+        line = _truncate(line, 200)  # одна длинная строка не должна съедать всё поле
+
+        added_len = len(line) + (1 if lines else 0)  # +1 за "\n" перед строкой, кроме первой
+        if used + added_len > budget:
+            break
+        lines.append(line)
+        used += added_len
+
+    remaining = len(items) - len(lines)
+    if remaining > 0:
+        lines.append(f"… и ещё {remaining}.")
+
+    return _truncate("\n".join(lines), _FIELD_VALUE_LIMIT)
+
+
+def build_restore_plan_embed(plan: RestorePlan, guild_name: str) -> discord.Embed:
+    """План восстановления (/load, L.backup restore) перед подтверждением —
+    что именно изменится, чтобы пользователь не восстанавливал сервер наугад."""
+    color = discord.Color.orange() if (plan.conflicts or plan.removes) else discord.Color.blurple()
+    embed = discord.Embed(
+        title="📋 План восстановления",
+        description=f"Сервер: **{guild_name}**\nБэкап: `{plan.backup_id}`",
+        color=color,
+    )
+    embed.add_field(name=f"🟢 Создать ({len(plan.creates)})", value=_format_items(plan.creates), inline=False)
+    embed.add_field(
+        name=f"🟡 Обновить ({len(plan.updates)})", value=_format_items(plan.updates, with_details=True), inline=False
+    )
+    if plan.remove_extra:
+        embed.add_field(
+            name=f"🔴 Удалить ({len(plan.removes)})", value=_format_items(plan.removes, with_details=True), inline=False
+        )
+    elif plan.removes:
+        embed.add_field(
+            name=f"⚪ Не в бэкапе, но останется ({len(plan.removes)})",
+            value="Удаление лишнего отключено — эти элементы не будут тронуты.",
+            inline=False,
+        )
+    if plan.conflicts:
+        embed.add_field(
+            name=f"⚠️ Конфликты, требуют ручного решения ({len(plan.conflicts)})",
+            value=_format_items(plan.conflicts, with_details=True),
+            inline=False,
+        )
+    if plan.is_empty:
+        embed.description += "\n\n✅ Текущее состояние сервера уже совпадает с бэкапом — изменений не требуется."
+    return embed
+
 
 def build_settings_embed(bot, guild: discord.Guild) -> discord.Embed:
     s = bot.db.get_all_settings(guild.id)
