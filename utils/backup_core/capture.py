@@ -13,6 +13,8 @@ import discord
 from . import storage
 from .models import (
     SCHEMA_VERSION,
+    AutoModActionData,
+    AutoModRuleData,
     BackupData,
     BackupMetadata,
     CategoryData,
@@ -22,6 +24,7 @@ from .models import (
     OverwriteData,
     RoleData,
     StickerData,
+    WebhookData,
 )
 
 # Discord ограничивает размер кастомных эмодзи/стикеров (256 КБ), так что
@@ -150,6 +153,66 @@ def _capture_guild_settings(guild: discord.Guild) -> GuildSettingsData:
     )
 
 
+async def _capture_automod_rules(guild: discord.Guild) -> list[AutoModRuleData]:
+    """AutoMod недоступен или бот может не иметь прав Manage Server — в этом
+    случае Discord вернёт HTTPException, и мы просто пропускаем секцию,
+    а не валим весь /save из-за одной необязательной части бэкапа."""
+    try:
+        fetched = await guild.fetch_automod_rules()
+    except discord.HTTPException:
+        return []
+
+    rules = []
+    for rule in fetched:
+        trigger = rule.trigger
+        actions = []
+        for act in rule.actions:
+            channel = guild.get_channel(act.channel_id) if act.channel_id else None
+            actions.append(
+                AutoModActionData(
+                    type=act.type.name,
+                    channel_name=channel.name if channel else None,
+                    duration_seconds=int(act.duration.total_seconds()) if act.duration else None,
+                    custom_message=act.custom_message,
+                )
+            )
+        rules.append(
+            AutoModRuleData(
+                name=rule.name,
+                event_type=rule.event_type.name,
+                trigger_type=trigger.type.name,
+                keyword_filter=list(trigger.keyword_filter or []),
+                regex_patterns=list(trigger.regex_patterns or []),
+                presets=list(trigger.presets.to_array()) if trigger.presets else [],
+                allow_list=list(trigger.allow_list or []),
+                mention_limit=trigger.mention_limit,
+                mention_raid_protection=bool(trigger.mention_raid_protection),
+                enabled=rule.enabled,
+                exempt_role_names=[r.name for r in rule.exempt_roles if r is not None],
+                exempt_channel_names=[c.name for c in rule.exempt_channels if c is not None],
+                actions=actions,
+            )
+        )
+    return rules
+
+
+async def _capture_webhooks(guild: discord.Guild) -> list[WebhookData]:
+    """Только структура (имя, канал, аватар) — токен вебхука не сохраняется:
+    Discord выдаёт новый при создании, старый восстановить нельзя в принципе."""
+    try:
+        fetched = await guild.webhooks()
+    except discord.HTTPException:
+        return []
+
+    webhooks = []
+    for wh in fetched:
+        if wh.channel is None or not wh.name:
+            continue
+        avatar_b64 = await _read_asset_b64(wh.avatar) if wh.avatar else None
+        webhooks.append(WebhookData(name=wh.name, channel_name=wh.channel.name, avatar_b64=avatar_b64))
+    return webhooks
+
+
 async def capture_guild(guild: discord.Guild, *, is_emergency: bool = False, note: str | None = None) -> BackupData:
     """Делает полный снимок структуры сервера. Ничего не пишет на диск —
     за это отвечает storage.save(), вызывающий код решает, сохранять ли результат."""
@@ -159,6 +222,8 @@ async def capture_guild(guild: discord.Guild, *, is_emergency: bool = False, not
     emojis = await _capture_emojis(guild)
     stickers = await _capture_stickers(guild)
     guild_settings = _capture_guild_settings(guild)
+    automod_rules = await _capture_automod_rules(guild)
+    webhooks = await _capture_webhooks(guild)
 
     counts = {
         "roles": len(roles),
@@ -169,6 +234,8 @@ async def capture_guild(guild: discord.Guild, *, is_emergency: bool = False, not
         "forum_channels": sum(1 for c in channels if c.type == "forum"),
         "emojis": len(emojis),
         "stickers": len(stickers),
+        "automod_rules": len(automod_rules),
+        "webhooks": len(webhooks),
     }
 
     metadata = BackupMetadata(
@@ -190,4 +257,6 @@ async def capture_guild(guild: discord.Guild, *, is_emergency: bool = False, not
         emojis=emojis,
         stickers=stickers,
         guild_settings=guild_settings,
+        automod_rules=automod_rules,
+        webhooks=webhooks,
     )

@@ -12,8 +12,8 @@ from discord.ext import commands
 
 from utils import backup_core
 from utils.backup_core.models import RestoreScope
-from utils.embeds import build_restore_plan_embed
-from utils.moderation_utils import is_mod_or_admin
+from utils.embeds import build_backup_action_log_embed, build_restore_plan_embed, format_missing_permissions_warning
+from utils.moderation_utils import is_mod_or_admin, send_mod_log
 
 VALID_SCOPES = ("all", "roles", "channels", "categories", "permissions")
 DUPLICATE_KIND_LABELS = {"role": "Роль", "category": "Категория", "channel": "Канал"}
@@ -56,15 +56,30 @@ class Backup(commands.Cog):
         elif action == "rollback":
             backup_id = args[0] if args else None
             await self._rollback(ctx, backup_id)
+        elif action == "diff":
+            if len(args) < 2:
+                return await ctx.send("Использование: `L.backup diff <id_бэкапа_1> <id_бэкапа_2>`")
+            await self._diff(ctx, args[0], args[1])
+        elif action == "resume":
+            cp_id = args[0] if args else None
+            await self._resume(ctx, cp_id)
         else:
-            await ctx.send("Использование: `L.backup save|restore|rollback|info|list|duplicates`")
+            await ctx.send("Использование: `L.backup save|restore|rollback|info|list|duplicates|diff|resume`")
 
     async def _save(self, ctx: commands.Context):
         counts = await backup_core.save_backup(ctx.guild)
         await ctx.send(
             f"💾 Бэкап сохранён (`{counts.get('backup_id', '?')}`): "
             f"{counts['roles']} ролей, {counts.get('categories', 0)} категорий, "
-            f"{counts['channels']} каналов, {counts.get('emojis', 0)} эмодзи, {counts.get('stickers', 0)} стикеров."
+            f"{counts['channels']} каналов, {counts.get('emojis', 0)} эмодзи, {counts.get('stickers', 0)} стикеров, "
+            f"{counts.get('automod_rules', 0)} правил AutoMod, {counts.get('webhooks', 0)} вебхуков."
+        )
+        await send_mod_log(
+            self.bot,
+            ctx.guild,
+            build_backup_action_log_embed(
+                "save", ctx.author, f"Создан бэкап `{counts.get('backup_id', '?')}` ({counts['roles']} ролей, {counts['channels']} каналов)."
+            ),
         )
 
     async def _info(self, ctx: commands.Context):
@@ -109,6 +124,61 @@ class Backup(commands.Cog):
             f"(сопоставление идёт по имени, не по ID):\n{text}"
         )
 
+    async def _resume(self, ctx: commands.Context, checkpoint_id: str | None):
+        checkpoints = backup_core.list_checkpoints(ctx.guild.id)
+        if not checkpoints:
+            return await ctx.send("✅ Незавершённых восстановлений нет.")
+
+        cp_id = checkpoint_id
+        if cp_id is None:
+            if len(checkpoints) == 1:
+                cp_id = checkpoints[0]["checkpoint_id"]
+            else:
+                lines = [f"`{c['checkpoint_id']}` — прогресс {c['progress']}, бэкап `{c['backup_id']}`" for c in checkpoints]
+                return await ctx.send("Найдено несколько чекпоинтов — укажите ID:\n" + "\n".join(lines))
+
+        status = await ctx.send(f"⏳ Возобновляю восстановление с чекпоинта `{cp_id}`...")
+        try:
+            progress_cb = backup_core.make_throttled_progress_callback(lambda text: status.edit(content=text))
+            _plan, result, emergency_id = await backup_core.resume_from_checkpoint(
+                ctx.guild, cp_id, progress_cb=progress_cb
+            )
+            content = (
+                f"✅ Восстановление завершено (resume): создано {result.total_created()}, "
+                f"обновлено {result.total_updated()}, удалено {result.total_removed()}.\n"
+                f"Пропущено конфликтов: {result.skipped_conflicts}."
+            )
+            if result.errors:
+                content += f"\n⚠️ Ошибок: {len(result.errors)} (первая: {result.errors[0]})"
+            if emergency_id:
+                content += f"\n🛟 Резервный бэкап для отката: `{emergency_id}`."
+            await send_mod_log(
+                self.bot, ctx.guild,
+                build_backup_action_log_embed("load", ctx.author, f"Возобновлено с чекпоинта `{cp_id}`. {content}"),
+            )
+        except FileNotFoundError:
+            content = f"⚠️ Чекпоинт `{cp_id}` не найден."
+        except discord.HTTPException as e:
+            content = f"⚠️ Ошибка Discord API при возобновлении: {e}"
+
+        async def try_edit(text):
+            await status.edit(content=text)
+
+        await backup_core.notify_guild_or_dm(ctx.guild, ctx.author, content, preferred=try_edit)
+
+    async def _diff(self, ctx: commands.Context, id1: str, id2: str):
+        try:
+            plan = backup_core.diff_backups(ctx.guild.id, id1, id2)
+        except FileNotFoundError:
+            return await ctx.send("⚠️ Один из указанных бэкапов не найден.")
+
+        embed = build_restore_plan_embed(plan, ctx.guild.name)
+        embed.title = "📋 Сравнение бэкапов"
+        embed.description = f"`{id1}` → `{id2}`"
+        if plan.is_empty:
+            embed.description += "\n\n✅ Между этими бэкапами нет различий."
+        await ctx.send(embed=embed)
+
     async def _restore(self, ctx: commands.Context, scope_keyword: str, mode: str):
         if not backup_core.has_backup(ctx.guild.id):
             return await ctx.send("⚠️ Бэкап не найден. Сначала выполните `L.backup save`.")
@@ -121,7 +191,7 @@ class Backup(commands.Cog):
         remove_extra = mode == "strict"
 
         try:
-            plan = backup_core.build_plan(ctx.guild, scope=scope, remove_extra=remove_extra)
+            plan = await backup_core.build_plan(ctx.guild, scope=scope, remove_extra=remove_extra)
         except FileNotFoundError:
             return await ctx.send("⚠️ Бэкап не найден.")
 
@@ -138,7 +208,7 @@ class Backup(commands.Cog):
         scope = RestoreScope.all()
         try:
             # remove_extra=True — смысл rollback в полном возврате к прежнему состоянию.
-            plan = backup_core.build_plan(ctx.guild, target_id, scope=scope, remove_extra=True)
+            plan = await backup_core.build_plan(ctx.guild, target_id, scope=scope, remove_extra=True)
         except FileNotFoundError:
             return await ctx.send("⚠️ Указанный бэкап не найден.")
 
@@ -157,6 +227,11 @@ class Backup(commands.Cog):
         await ctx.send(embed=build_restore_plan_embed(plan, ctx.guild.name))
         if plan.is_empty:
             return await ctx.send("Восстанавливать ничего не нужно.")
+
+        missing_perms = backup_core.missing_permissions_for_scope(ctx.guild, scope)
+        warning = format_missing_permissions_warning(missing_perms)
+        if warning:
+            await ctx.send(warning)
 
         verb = "откат" if is_rollback else "восстановление"
         await ctx.send(
@@ -187,6 +262,19 @@ class Backup(commands.Cog):
                 content += f"\n⚠️ Ошибок: {len(result.errors)} (первая: {result.errors[0]})"
             if emergency_id:
                 content += f"\n🛟 Резервный бэкап на случай отката: `{emergency_id}`."
+
+            log_description = (
+                f"Бэкап: `{backup_id or 'последний'}` · Область: `{scope}` · "
+                f"Удаление лишнего: {'да' if remove_extra else 'нет'}\n"
+                f"Создано: {result.total_created()}, обновлено: {result.total_updated()}, "
+                f"удалено: {result.total_removed()}, конфликтов: {result.skipped_conflicts}, "
+                f"ошибок: {len(result.errors)}."
+            )
+            await send_mod_log(
+                self.bot,
+                ctx.guild,
+                build_backup_action_log_embed("rollback" if is_rollback else "load", ctx.author, log_description),
+            )
         except discord.HTTPException as e:
             content = f"⚠️ {verb.capitalize()} завершился с ошибкой Discord API: {e}"
 

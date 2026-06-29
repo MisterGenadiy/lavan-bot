@@ -15,11 +15,20 @@ from __future__ import annotations
 
 import discord
 
-from . import capture, diff, storage
+from . import capture, diff, storage, locks
+from . import checkpoint as _cp_module
 from .models import BackupData, PlanItem, RestorePlan, RestoreScope
-from .diff import DuplicateGroup, find_duplicate_entities
+from .diff import DuplicateGroup, compare_backups, find_duplicate_entities
 from .notify import notify_guild_or_dm
-from .restore import RestoreResult, apply_plan, create_emergency_backup, make_throttled_progress_callback, restore_with_safety
+from .permissions import missing_permissions_for_scope
+from .restore import (
+    RestoreResult,
+    apply_plan,
+    create_emergency_backup,
+    make_throttled_progress_callback,
+    restore_with_safety,
+    resume_from_checkpoint,
+)
 
 __all__ = [
     "save_backup",
@@ -31,9 +40,13 @@ __all__ = [
     "apply_plan",
     "create_emergency_backup",
     "restore_with_safety",
+    "resume_from_checkpoint",
+    "list_checkpoints",
     "restore_backup",
     "latest_emergency_backup_id",
     "find_duplicates",
+    "diff_backups",
+    "missing_permissions_for_scope",
     "notify_guild_or_dm",
     "make_throttled_progress_callback",
     "RestoreScope",
@@ -58,19 +71,32 @@ def latest_emergency_backup_id(guild_id: int) -> str | None:
     return storage.latest_emergency_backup_id(guild_id)
 
 
+def diff_backups(guild_id: int, old_backup_id: str, new_backup_id: str) -> RestorePlan:
+    """Сравнивает два сохранённых бэкапа ОДНОГО сервера между собой — «что
+    изменилось между датой A и датой B», без затрагивания текущего состояния
+    сервера и без какого-либо restore. Используется /backup-diff."""
+    old = load_backup(guild_id, old_backup_id)
+    new = load_backup(guild_id, new_backup_id)
+    return compare_backups(old, new)
+
+
 async def save_backup(guild: discord.Guild) -> dict:
     """Сохраняет полный снимок структуры сервера. Возвращает счётчики
     (роли/категории/каналы/эмодзи/стикеры и т.п.) — формат словаря расширен
     по сравнению со старой версией, но старые ключи ('roles', 'channels')
-    сохранены, так что код, читающий только их, продолжает работать."""
-    data = await capture.capture_guild(guild)
-    storage.save(data)
-    storage.prune_old_backups(guild.id)  # держим только последние N бэкапов — см. storage.MAX_REGULAR_BACKUPS
-    counts = dict(data.metadata.counts)
-    counts.setdefault("roles", len(data.roles))
-    counts.setdefault("channels", len(data.channels) + len(data.categories))
-    counts["backup_id"] = data.metadata.backup_id
-    return counts
+    сохранены, так что код, читающий только их, продолжает работать.
+
+    Захватывает per-guild lock — на случай, если /save и /load (который сам
+    тоже снимает emergency-бэкап) запустят почти одновременно на одном сервере."""
+    async with locks.get_guild_lock(guild.id):
+        data = await capture.capture_guild(guild)
+        storage.save(data)
+        storage.prune_old_backups(guild.id)  # держим только последние N бэкапов — см. storage.MAX_REGULAR_BACKUPS
+        counts = dict(data.metadata.counts)
+        counts.setdefault("roles", len(data.roles))
+        counts.setdefault("channels", len(data.channels) + len(data.categories))
+        counts["backup_id"] = data.metadata.backup_id
+        return counts
 
 
 def has_backup(guild_id: int) -> bool:
@@ -115,20 +141,29 @@ def get_backup_info(guild_id: int, backup_id: str | None = None) -> dict | None:
     }
 
 
-def build_plan(
+async def build_plan(
     guild: discord.Guild,
     backup_id: str | None = None,
     *,
     scope: RestoreScope = None,
     remove_extra: bool = False,
+    source_guild_id: int | None = None,
 ) -> RestorePlan:
     """Строит план восстановления без применения — то, что показывается
-    пользователю в /load до нажатия кнопки подтверждения."""
-    target_id = backup_id or storage.latest_backup_id(guild.id)
+    пользователю в /load до нажатия кнопки подтверждения.
+
+    Это корутина (а не обычная функция) — для области AUTOMOD/WEBHOOKS план
+    должен сходить в Discord API за текущими правилами/вебхуками сервера,
+    которые не лежат в обычных закэшированных атрибутах guild.
+
+    source_guild_id — для предпросмотра клонирования бэкапа с ОДНОГО сервера
+    на ДРУГОЙ (см. restore_with_safety)."""
+    source_id = source_guild_id if source_guild_id is not None else guild.id
+    target_id = backup_id or storage.latest_backup_id(source_id)
     if target_id is None:
         raise FileNotFoundError("Бэкап не найден")
-    backup = storage.load(guild.id, target_id)
-    return diff.build_plan(guild, backup, scope=scope or RestoreScope.all(), remove_extra=remove_extra)
+    backup = storage.load(source_id, target_id)
+    return await diff.build_plan(guild, backup, scope=scope or RestoreScope.all(), remove_extra=remove_extra)
 
 
 async def restore_backup(guild: discord.Guild) -> dict:
@@ -140,3 +175,10 @@ async def restore_backup(guild: discord.Guild) -> dict:
     напрямую — это даёт предпросмотр плана и emergency-бэкап перед стартом."""
     plan, result, _emergency_id = await restore_with_safety(guild, scope=RestoreScope.all(), remove_extra=True)
     return {"roles": result.total_created() + result.total_updated(), "channels": result.total_created()}
+
+
+def list_checkpoints(guild_id: int) -> list[dict]:
+    """Незавершённые чекпоинты восстановления — восстановление прервалось
+    (краш бота, перезапуск при деплое) и его можно продолжить командой
+    /resume или L.backup resume."""
+    return _cp_module.list_checkpoints(guild_id)

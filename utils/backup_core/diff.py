@@ -23,12 +23,14 @@ from .models import (
     ACTION_CREATE,
     ACTION_REMOVE,
     ACTION_UPDATE,
+    KIND_AUTOMOD,
     KIND_CATEGORY,
     KIND_CHANNEL,
     KIND_EMOJI,
     KIND_GUILD_SETTINGS,
     KIND_ROLE,
     KIND_STICKER,
+    KIND_WEBHOOK,
     BackupData,
     ChannelData,
     OverwriteData,
@@ -313,6 +315,28 @@ def _diff_stickers(guild: discord.Guild, backup_stickers) -> list[PlanItem]:
     ]
 
 
+def _diff_automod_rules(guild: discord.Guild, backup_rules, *, current_rules) -> list[PlanItem]:
+    """Как с эмодзи/стикерами: содержимое правила не диффится по полям —
+    только «есть правило с таким именем или нет». Полное сравнение всех
+    условий/действий правила добавляет сложности непропорционально пользе:
+    отсутствующее правило достаточно просто пересоздать."""
+    current_names = {r.name for r in current_rules}
+    return [
+        PlanItem(kind=KIND_AUTOMOD, action=ACTION_CREATE, name=r.name, backup_obj=r)
+        for r in backup_rules
+        if r.name not in current_names
+    ]
+
+
+def _diff_webhooks(guild: discord.Guild, backup_webhooks, *, current_webhooks) -> list[PlanItem]:
+    current_keys = {(w.name, w.channel.name if w.channel else None) for w in current_webhooks}
+    return [
+        PlanItem(kind=KIND_WEBHOOK, action=ACTION_CREATE, name=w.name, backup_obj=w)
+        for w in backup_webhooks
+        if (w.name, w.channel_name) not in current_keys
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Настройки сервера
 # ---------------------------------------------------------------------------
@@ -349,7 +373,11 @@ def _diff_guild_settings(guild: discord.Guild, backup_settings) -> list[PlanItem
 # ---------------------------------------------------------------------------
 
 
-def build_plan(guild: discord.Guild, backup: BackupData, *, scope: RestoreScope, remove_extra: bool) -> RestorePlan:
+async def build_plan(guild: discord.Guild, backup: BackupData, *, scope: RestoreScope, remove_extra: bool) -> RestorePlan:
+    """ВАЖНО: async — в отличие от остальных _diff_* выше, AutoMod-правила и
+    вебхуки нельзя прочитать из обычных атрибутов guild (как guild.roles),
+    их нужно отдельно запрашивать у Discord API (fetch_automod_rules/webhooks),
+    поэтому сборка плана в целом стала корутиной."""
     items: list[PlanItem] = []
 
     if RestoreScope.ROLES in scope:
@@ -372,10 +400,90 @@ def build_plan(guild: discord.Guild, backup: BackupData, *, scope: RestoreScope,
     if RestoreScope.GUILD_SETTINGS in scope:
         items += _diff_guild_settings(guild, backup.guild_settings)
 
+    if RestoreScope.AUTOMOD in scope:
+        try:
+            current_rules = await guild.fetch_automod_rules()
+        except discord.HTTPException:
+            current_rules = []  # нет прав / фича недоступна — считаем, что на сервере правил нет
+        items += _diff_automod_rules(guild, backup.automod_rules, current_rules=current_rules)
+
+    if RestoreScope.WEBHOOKS in scope:
+        try:
+            current_webhooks = await guild.webhooks()
+        except discord.HTTPException:
+            current_webhooks = []
+        items += _diff_webhooks(guild, backup.webhooks, current_webhooks=current_webhooks)
+
     if not remove_extra:
         items = [i for i in items if i.action != ACTION_REMOVE]
 
     return RestorePlan(backup_id=backup.metadata.backup_id, scope=scope, remove_extra=remove_extra, items=items)
+
+
+def compare_backups(old: BackupData, new: BackupData) -> RestorePlan:
+    """Сравнивает ДВА бэкапа между собой (а не бэкап с текущим сервером,
+    как build_plan выше) — «что изменилось на сервере между датой A и датой B».
+    Чисто информационно, ничего не применяется и не может быть применено:
+    current_id у всех пунктов всегда None, conflict-пунктов не бывает
+    (обе стороны — статичные снимки, а не живой Discord-сервер с реальными
+    дублями имён). remove_extra=True у итогового плана нужен только чтобы
+    build_restore_plan_embed() показал секцию «удалено» — это не означает
+    «удалить что-то», тут просто нет такого действия в принципе."""
+    items: list[PlanItem] = []
+
+    items += _compare_named_list(old.roles, new.roles, kind=KIND_ROLE, key=lambda r: r.name, equal=_roles_equal)
+    items += _compare_named_list(
+        old.categories, new.categories, kind=KIND_CATEGORY, key=lambda c: c.name, equal=_categories_equal
+    )
+    items += _compare_named_list(
+        old.channels, new.channels, kind=KIND_CHANNEL,
+        key=lambda c: _channel_key(c.name, c.category_name), equal=_channels_equal,
+        name_from_key=lambda k: f"{k[1]} (в «{k[0]}»)" if k[0] else k[1],
+    )
+    items += _compare_named_list(old.emojis, new.emojis, kind=KIND_EMOJI, key=lambda e: e.name, equal=lambda a, b: True)
+    items += _compare_named_list(old.stickers, new.stickers, kind=KIND_STICKER, key=lambda s: s.name, equal=lambda a, b: True)
+
+    return RestorePlan(backup_id=new.metadata.backup_id, scope=RestoreScope.all(), remove_extra=True, items=items)
+
+
+def _roles_equal(a: RoleData, b: RoleData) -> bool:
+    return (a.permissions, a.color, a.hoist, a.mentionable) == (b.permissions, b.color, b.hoist, b.mentionable)
+
+
+def _categories_equal(a, b) -> bool:
+    return _overwrites_equal(a.overwrites, b.overwrites)
+
+
+def _channels_equal(a: ChannelData, b: ChannelData) -> bool:
+    return (a.type, a.topic, a.nsfw, a.slowmode_delay) == (b.type, b.topic, b.nsfw, b.slowmode_delay) and _overwrites_equal(
+        a.overwrites, b.overwrites
+    )
+
+
+def _compare_named_list(old_items, new_items, *, kind: str, key, equal, name_from_key=lambda k: k):
+    """Обобщённое сравнение двух списков именованных сущностей бэкапа по
+    ключу — общая основа для роль/категория/канал/эмодзи/стикер веток
+    compare_backups(), чтобы не повторять одну и ту же группировку 5 раз."""
+    old_by_key = _group_by_name(old_items, key=key)
+    new_by_key = _group_by_name(new_items, key=key)
+    items: list[PlanItem] = []
+
+    for k, new_group in new_by_key.items():
+        old_group = old_by_key.get(k, [])
+        name = name_from_key(k)
+        if not old_group:
+            for obj in new_group:
+                items.append(PlanItem(kind=kind, action=ACTION_CREATE, name=name, backup_obj=obj))
+        elif not equal(old_group[0], new_group[0]):
+            items.append(PlanItem(kind=kind, action=ACTION_UPDATE, name=name, backup_obj=new_group[0]))
+
+    for k, old_group in old_by_key.items():
+        if k not in new_by_key:
+            name = name_from_key(k)
+            for obj in old_group:
+                items.append(PlanItem(kind=kind, action=ACTION_REMOVE, name=name, backup_obj=obj))
+
+    return items
 
 
 @dataclass

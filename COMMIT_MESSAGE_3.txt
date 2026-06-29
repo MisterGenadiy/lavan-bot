@@ -1,0 +1,82 @@
+feat(backup): audit-log relay, pre-checks, gzip, diff, AutoMod/webhooks, checkpoints, resume
+
+Полный список изменений этой сессии (от простого к сложному):
+
+## 1. Audit-log relay (cogs/auditwatch.py — новый cog)
+- on_audit_log_entry_create: дублирует ВСЁ Discord audit log в настроенный
+  канал — создание/удаление каналов, ролей, прав, баны, настройки сервера,
+  вебхуки, эмодзи, AutoMod, приглашения, интеграции (67 типов событий).
+- Включается командой: L.auditwatch on/off [#канал] или /auditwatch.
+- Ошибка отправки одного события (rate limit) не роняет бот целиком.
+- Новые настройки: auditwatch_enabled, auditwatch_channel_id в DATABASE.
+
+## 2. Лог действий с бэкапом в mod-log (utils/embeds.py: build_backup_action_log_embed)
+- /save, /load, /rollback, /clone-template, /resume и их L.backup аналоги
+  дублируют итог в mod-log-channel (тот же, что используется для модерации) —
+  кто, когда и какой бэкап применил, сколько создано/обновлено/удалено.
+
+## 3. Pre-flight проверка прав бота (utils/backup_core/permissions.py — новый модуль)
+- missing_permissions_for_scope() — до применения плана показывает,
+  каких прав не хватает боту для выбранной области restore (Manage Roles,
+  Manage Channels, Manage Emojis and Stickers, Manage Server).
+- Предупреждение показывается вместе с embed плана, ДО кнопки подтверждения.
+- Тесты: tests/test_permissions.py (4 теста).
+
+## 4. Gzip-сжатие бэкапов (utils/backup_core/storage.py)
+- Новые бэкапы пишутся как .json.gz (сжатие в 5–10 раз для типичного JSON).
+- Старые несжатые .json читаются прозрачно (backward compat).
+- Дедупликация в list_backups при одновременном наличии обоих расширений.
+- Тесты: 4 новых кейса в tests/test_storage.py.
+
+## 5. /backup-diff / L.backup diff (utils/backup_core/diff.py: compare_backups)
+- Сравнение двух бэкапов одного сервера между собой (А→Б).
+- Не затрагивает текущий сервер, не требует подтверждения — чисто
+  информационный embed «что изменилось между датой A и датой B».
+- Тесты: 3 новых кейса в tests/test_diff.py.
+
+## 6. AutoMod-правила и вебхуки в бэкап (schema v3)
+- Захват: capture._capture_automod_rules, _capture_webhooks.
+- Diff: diff._diff_automod_rules, _diff_webhooks (create-only по имени).
+- Restore: restore._apply_automod_rule, _apply_webhook.
+- Новые модели: AutoModRuleData, AutoModActionData, WebhookData в models.py.
+- Новые флаги в RestoreScope: AUTOMOD, WEBHOOKS (включены в .all()).
+- build_plan стал async (нужен await guild.fetch_automod_rules()/webhooks()).
+- Тесты: 4 новых в test_diff.py, 4 новых в test_restore.py.
+
+## 7. Per-guild asyncio.Lock (utils/backup_core/locks.py — новый модуль)
+- Защита от гонки при одновременных /save и /load на одном сервере.
+- Оба захватывают get_guild_lock(guild.id) — один ждёт завершения другого.
+- Разные серверы не блокируют друг друга (независимые Lock-объекты).
+- Тесты: tests/test_locks.py (4 теста: корректность, сериализация, изоляция).
+
+## 8. /clone-template (cogs/slash.py)
+- Только для владельца бота: применить бэкап с ДРУГОГО сервера как шаблон.
+- restore_with_safety(source_guild_id=...) — читает бэкап источника,
+  применяет на текущий сервер через тот же diff/plan/confirm flow.
+- Автодополнение: clone_backup_id_autocomplete (читает бэкапы источника).
+- build_plan тоже поддерживает source_guild_id для предпросмотра.
+
+## 9. Checkpoints и /resume (utils/backup_core/checkpoint.py — новый модуль)
+- restore_with_safety создаёт чекпоинт ДО apply_plan и обновляет его
+  по ходу (троттлинг записи на диск: раз в 2 сек).
+- При успешном завершении чекпоинт удаляется автоматически.
+- При краше/перезапуске бота чекпоинт остаётся в
+  backups/{guild_id}/_checkpoints/{id}.json.
+- /resume [чекпоинт] / L.backup resume [id] — продолжает с того места:
+  пропускает уже выполненные пункты, сохраняет накопленный результат.
+- resume_from_checkpoint() в backup_core публичного API.
+- list_checkpoints() показывает незавершённые восстановления.
+- Тесты: tests/test_checkpoint.py (8 тестов: create/load/write/skip/merge).
+
+## Тесты
+Итог: 83 теста (было 71), все проходят на Python 3.11/3.12.
+Новые файлы: test_permissions.py, test_locks.py, test_checkpoint.py.
+Обновлены: test_storage.py, test_diff.py, test_restore.py.
+
+## Файлы, не тронутые намеренно
+cogs/antispam.py, antiraid.py, antilink.py, moderation.py, settings.py,
+verification.py, utils/database.py, utils/moderation_utils.py, bot.py
+(за исключением добавления "cogs.auditwatch" в список extensions).
+
+BREAKING: нет. Все новые параметры опциональны. Старый backup_core.py API
+(save_backup, has_backup, restore_backup и т.д.) работает без изменений.

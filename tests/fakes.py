@@ -107,8 +107,26 @@ class FakeChannel:
     async def delete(self, **kwargs):
         pass
 
+    async def create_webhook(self, *, name, avatar=None, reason=None):
+        return FakeWebhook(name, channel=self)
+
     def is_news(self):
         return self._kind == "announcement"
+
+
+class FakeWebhook:
+    def __init__(self, name, *, channel=None):
+        self.name = name
+        self.channel = channel
+        self.avatar = None
+
+
+class FakeAutoModRule:
+    """Минимальная замена discord.AutoModRule для diff/restore-тестов —
+    нужно только то, что читает capture/diff: .name (для сопоставления по имени)."""
+
+    def __init__(self, name):
+        self.name = name
 
 
 class FakeGuild:
@@ -124,12 +142,15 @@ class FakeGuild:
         self._channels: list[FakeChannel] = []
         self.emojis: list = []
         self.stickers: list = []
+        self.automod_rules: list = []  # тесты заполняют напрямую — то, что "сейчас на сервере"
+        self.webhook_list: list = []   # аналогично, для guild.webhooks()
         self.verification_level = discord.VerificationLevel.low
         self.explicit_content_filter = discord.ContentFilter.disabled
         self.default_notifications = discord.NotificationLevel.all_messages
         self.afk_channel = None
         self.afk_timeout = 300
         self.system_channel = None
+        self.me = None  # тесты на права бота (test_permissions.py) подставляют свой объект
         self.create_calls = []
 
     @property
@@ -140,6 +161,20 @@ class FakeGuild:
         # от discord.CategoryChannel, поэтому такой isinstance-фильтр их не уберёт —
         # тут просто сразу отдаём то же множество, которое фильтр вернул бы в реальности.
         return list(self._channels)
+
+    @property
+    def text_channels(self):
+        return [c for c in self._channels if c._kind in ("text", "announcement")]
+
+    async def fetch_automod_rules(self):
+        return list(self.automod_rules)
+
+    async def webhooks(self):
+        return list(self.webhook_list)
+
+    async def create_automod_rule(self, **kwargs):
+        self.create_calls.append(("automod_rule", kwargs.get("name")))
+        return FakeAutoModRule(kwargs.get("name"))
 
     def get_role(self, role_id):
         return next((r for r in self.roles if r.id == role_id), None)

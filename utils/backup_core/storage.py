@@ -14,6 +14,7 @@ migrate_legacy() оборачивает их в актуальную схему 
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import time
@@ -23,6 +24,14 @@ from .models import BackupData, BackupMetadata, RoleData, ChannelData, Overwrite
 
 BACKUP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "backups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
+
+# Новые бэкапы сжимаются gzip'ом — на сервере с сотней кастомных эмодзи/стикеров
+# (картинки лежат в JSON как base64) файл легко вырастает до нескольких МБ,
+# а текстовый JSON с повторяющимися ключами сжимается очень хорошо (обычно в 5-10 раз).
+# Бэкапы, сохранённые ДО этого изменения (расширение .json, без сжатия), по-прежнему
+# читаются как обычные JSON-файлы — см. _existing_backup_path()/_open_for_read().
+_COMPRESSED_SUFFIX = ".json.gz"
+_PLAIN_SUFFIX = ".json"
 
 
 def _guild_dir(guild_id: int) -> str:
@@ -43,7 +52,30 @@ def generate_backup_id() -> str:
 
 
 def _backup_path(guild_id: int, backup_id: str) -> str:
-    return os.path.join(_guild_dir(guild_id), f"{backup_id}.json")
+    """Путь для ЗАПИСИ нового бэкапа — всегда сжатый .json.gz."""
+    return os.path.join(_guild_dir(guild_id), f"{backup_id}{_COMPRESSED_SUFFIX}")
+
+
+def _existing_backup_path(guild_id: int, backup_id: str) -> str | None:
+    """Путь для ЧТЕНИЯ — бэкап может быть как новым (сжатым), так и старым
+    (несжатым, сохранённым до этого изменения). Возвращает None, если файла
+    с таким backup_id вообще нет ни в каком виде."""
+    compressed = os.path.join(_guild_dir(guild_id), f"{backup_id}{_COMPRESSED_SUFFIX}")
+    if os.path.exists(compressed):
+        return compressed
+    plain = os.path.join(_guild_dir(guild_id), f"{backup_id}{_PLAIN_SUFFIX}")
+    if os.path.exists(plain):
+        return plain
+    return None
+
+
+def _open_for_read(path: str):
+    """gzip.open сам определяет, что делать, по магическим байтам было бы
+    надёжнее, но проще и достаточно ориентироваться на расширение файла —
+    мы сами контролируем, как и с каким именем что записывается."""
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, encoding="utf-8")
 
 
 def migrate_legacy(raw: dict, guild_id: int) -> BackupData:
@@ -92,19 +124,25 @@ def migrate_legacy(raw: dict, guild_id: int) -> BackupData:
 
 
 def save(data: BackupData) -> str:
-    """Пишет бэкап на диск, возвращает его backup_id."""
+    """Пишет бэкап на диск (сжатым gzip'ом), возвращает его backup_id."""
     path = _backup_path(data.metadata.guild_id, data.metadata.backup_id)
-    with open(path, "w", encoding="utf-8") as f:
+    with gzip.open(path, "wt", encoding="utf-8") as f:
         json.dump(data.to_dict(), f, ensure_ascii=False, indent=2)
     return data.metadata.backup_id
 
 
 def list_backups(guild_id: int) -> list[str]:
-    """ID всех бэкапов сервера, от старых к новым (по имени файла, оно сортируемо по времени)."""
+    """ID всех бэкапов сервера, от старых к новым (по имени файла, оно сортируемо по времени).
+    Распознаёт и новые сжатые файлы (.json.gz), и старые несжатые (.json)."""
     directory = os.path.join(BACKUP_DIR, str(guild_id))
     if not os.path.isdir(directory):
         return []
-    ids = [fn[:-5] for fn in os.listdir(directory) if fn.endswith(".json")]
+    ids = set()
+    for fn in os.listdir(directory):
+        if fn.endswith(_COMPRESSED_SUFFIX):
+            ids.add(fn[: -len(_COMPRESSED_SUFFIX)])
+        elif fn.endswith(_PLAIN_SUFFIX):
+            ids.add(fn[: -len(_PLAIN_SUFFIX)])
     return sorted(ids)
 
 
@@ -136,13 +174,15 @@ def latest_emergency_backup_id(guild_id: int) -> str | None:
 
 
 def load(guild_id: int, backup_id: str) -> BackupData:
-    if backup_id == f"legacy-{guild_id}" and not os.path.exists(_backup_path(guild_id, backup_id)):
+    if backup_id == f"legacy-{guild_id}" and _existing_backup_path(guild_id, backup_id) is None:
         with open(_legacy_path(guild_id), encoding="utf-8") as f:
             raw = json.load(f)
         return migrate_legacy(raw, guild_id)
 
-    path = _backup_path(guild_id, backup_id)
-    with open(path, encoding="utf-8") as f:
+    path = _existing_backup_path(guild_id, backup_id)
+    if path is None:
+        raise FileNotFoundError(f"Бэкап {backup_id} не найден для сервера {guild_id}")
+    with _open_for_read(path) as f:
         raw = json.load(f)
     if "metadata" not in raw:
         return migrate_legacy(raw, guild_id)
@@ -185,8 +225,11 @@ def prune_old_backups(
     for bucket, keep in ((regular, keep_regular), (emergency, keep_emergency)):
         excess = bucket[: max(0, len(bucket) - keep)]
         for backup_id in excess:
+            path = _existing_backup_path(guild_id, backup_id)
+            if path is None:
+                continue
             try:
-                os.remove(_backup_path(guild_id, backup_id))
+                os.remove(path)
                 removed += 1
             except OSError:
                 pass

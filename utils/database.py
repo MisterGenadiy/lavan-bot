@@ -107,6 +107,9 @@ class Database:
         "verification_unverified_role_id": None,  # роль, выдаваемая при вступлении (ограничивает доступ)
         "verification_verified_role_id": None,    # роль, выдаваемая после подтверждения (опционально)
         "verification_timeout_minutes": 0,   # 0 = бессрочно; >0 — кикнуть, если не подтвердил за N минут
+        # ---- Аудит-лог вотчер ----
+        "auditwatch_enabled": False,
+        "auditwatch_channel_id": None,  # канал, куда дублируется ВЕСЬ аудит-лог сервера
     }
 
     def ensure_guild(self, guild_id: int):

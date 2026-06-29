@@ -222,6 +222,21 @@ class Settings(commands.Cog):
         removed = self.bot.db.remove_warn_action(ctx.guild.id, warn_count)
         await ctx.send("✅ Удалено." if removed else "⚠️ Такого правила не найдено.")
 
+    @commands.command(name="auditwatch")
+    @is_mod_or_admin()
+    async def auditwatch_cmd(self, ctx: commands.Context, enabled: str, channel: discord.TextChannel = None):
+        """L.auditwatch on/off [#канал] — дублировать ВЕСЬ аудит-лог сервера
+        (создание/удаление/изменение каналов, ролей, прав, баны, настройки
+        сервера и т.п.) в указанный канал, независимо от лимитов антирейда/анти-краша."""
+        on = enabled.lower() in ("on", "вкл", "true", "1")
+        if on and channel is None and not self.bot.db.get_setting(ctx.guild.id, "auditwatch_channel_id"):
+            return await ctx.send("⚠️ Укажите канал: `L.auditwatch on #канал`.")
+        self.bot.db.set_setting(ctx.guild.id, "auditwatch_enabled", on)
+        if channel is not None:
+            self.bot.db.set_setting(ctx.guild.id, "auditwatch_channel_id", channel.id)
+        target = channel.mention if channel else "ранее указанный канал"
+        await ctx.send(f"✅ Аудит-лог вотчер: {'включён' if on else 'выключен'}" + (f" → {target}" if on else "."))
+
     @commands.command(name="warn-actions", aliases=["wal"])
     @is_mod_or_admin()
     async def list_warn_actions(self, ctx: commands.Context):

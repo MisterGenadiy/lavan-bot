@@ -115,3 +115,66 @@ def test_prune_old_backups_noop_when_under_limit(isolated_backup_dir):
     removed = storage.prune_old_backups(guild_id)
     assert removed == 0
     assert len(storage.list_backups(guild_id)) == 1
+
+
+def test_save_writes_a_gzip_compressed_file(isolated_backup_dir):
+    import gzip as gzip_module
+
+    data = _make_backup(321, backup_id="100-gziptest")
+    storage.save(data)
+
+    path = os.path.join(storage.BACKUP_DIR, "321", "100-gziptest.json.gz")
+    assert os.path.exists(path)
+    with gzip_module.open(path, "rt", encoding="utf-8") as f:
+        raw = json.load(f)
+    assert raw["metadata"]["guild_name"] == "Test"
+
+
+def test_load_reads_old_uncompressed_package_format_file(isolated_backup_dir):
+    """Бэкапы, сохранённые ДО внедрения gzip (новый формат с metadata, но
+    обычный .json без сжатия), должны читаться так же, как и новые сжатые."""
+    guild_dir = os.path.join(storage.BACKUP_DIR, "654")
+    os.makedirs(guild_dir, exist_ok=True)
+    data = _make_backup(654, backup_id="050-plaintest")
+    plain_path = os.path.join(guild_dir, "050-plaintest.json")
+    with open(plain_path, "w", encoding="utf-8") as f:
+        json.dump(data.to_dict(), f)
+
+    assert storage.list_backups(654) == ["050-plaintest"]
+    loaded = storage.load(654, "050-plaintest")
+    assert loaded.metadata.guild_name == "Test"
+
+
+def test_list_backups_deduplicates_when_both_extensions_present(isolated_backup_dir):
+    """Если по какой-то причине для одного backup_id существуют и .json, и
+    .json.gz (например, прерванная миграция) — id не должен дублироваться."""
+    guild_dir = os.path.join(storage.BACKUP_DIR, "777")
+    os.makedirs(guild_dir, exist_ok=True)
+    data = _make_backup(777, backup_id="100-dupe0000")
+    with open(os.path.join(guild_dir, "100-dupe0000.json"), "w", encoding="utf-8") as f:
+        json.dump(data.to_dict(), f)
+    storage.save(data)  # пишет 100-dupe0000.json.gz
+
+    ids = storage.list_backups(777)
+    assert ids.count("100-dupe0000") == 1
+
+
+def test_compressed_backup_is_smaller_than_plain_for_repetitive_content(isolated_backup_dir):
+    """Не строгая гарантия для любых данных, но для типичного бэкапа с
+    повторяющимися ключами/структурой gzip должен ощутимо уменьшать размер."""
+    metadata = BackupMetadata(
+        backup_id="100-sizetest", created_at="2026-01-01T00:00:00", schema_version=2,
+        guild_id=1, guild_name="Test", counts={},
+    )
+    roles = [
+        RoleData(name=f"Role {i}", color=0, hoist=False, mentionable=False, permissions=8, position=i)
+        for i in range(200)
+    ]
+    data = BackupData(metadata=metadata, roles=roles)
+    storage.save(data)
+
+    gz_path = os.path.join(storage.BACKUP_DIR, "1", "100-sizetest.json.gz")
+    plain_size = len(json.dumps(data.to_dict(), ensure_ascii=False, indent=2).encode("utf-8"))
+    compressed_size = os.path.getsize(gz_path)
+
+    assert compressed_size < plain_size

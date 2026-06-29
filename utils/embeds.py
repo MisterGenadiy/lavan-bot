@@ -92,6 +92,32 @@ def build_restore_plan_embed(plan: RestorePlan, guild_name: str) -> discord.Embe
     return embed
 
 
+def format_missing_permissions_warning(missing: list[str]) -> str:
+    """Текст-предупреждение, если у бота не хватает прав для выбранной области
+    восстановления — показывается ДО подтверждения, а не выясняется по ходу
+    restore через малопонятные 403 от Discord API."""
+    if not missing:
+        return ""
+    return (
+        f"⚠️ У бота не хватает прав: **{', '.join(missing)}**. "
+        "Соответствующая часть плана не применится, пока права не выданы роли бота.\n\n"
+    )
+
+
+def build_backup_action_log_embed(action: str, user, description: str) -> discord.Embed:
+    """Запись для mod-log-канала о действии с бэкапом (/save, /load, /rollback
+    и их префиксные аналоги) — кто и когда трогал структуру сервера через
+    бэкап, важно для аудита независимо от того, как прошла сама операция."""
+    icons = {"save": "💾", "load": "♻️", "rollback": "⏪", "clone": "🧬"}
+    embed = discord.Embed(
+        title=f"{icons.get(action, '💾')} Бэкап: {action}",
+        description=description,
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"Инициатор: {user}")
+    return embed
+
+
 def build_settings_embed(bot, guild: discord.Guild) -> discord.Embed:
     s = bot.db.get_all_settings(guild.id)
     log_ch = guild.get_channel(s["log_channel_id"]) if s["log_channel_id"] else None

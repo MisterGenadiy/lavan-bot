@@ -243,3 +243,79 @@ def test_throttled_progress_callback_limits_call_rate():
     assert len(calls) == 2
     assert "1/5" in calls[0]
     assert "5/5" in calls[1]
+
+
+# ---------------------------------------------------------------------------
+# apply_plan — AutoMod-правила и вебхуки
+# ---------------------------------------------------------------------------
+
+
+def test_apply_plan_creates_automod_rule_with_keyword_trigger():
+    from utils.backup_core.models import AutoModActionData, AutoModRuleData, KIND_AUTOMOD
+
+    guild = FakeGuild()
+    rule_data = AutoModRuleData(
+        name="No bad words",
+        event_type="message_send",
+        trigger_type="keyword",
+        keyword_filter=["badword"],
+        actions=[AutoModActionData(type="block_message")],
+    )
+    plan = RestorePlan(
+        backup_id="b1", scope=RestoreScope.AUTOMOD, remove_extra=False,
+        items=[PlanItem(kind=KIND_AUTOMOD, action=ACTION_CREATE, name="No bad words", backup_obj=rule_data)],
+    )
+
+    result = run(restore_module.apply_plan(guild, plan))
+
+    assert result.created[KIND_AUTOMOD] == 1
+    assert ("automod_rule", "No bad words") in guild.create_calls
+
+
+def test_apply_plan_automod_rule_without_actions_reports_error():
+    from utils.backup_core.models import AutoModRuleData, KIND_AUTOMOD
+
+    guild = FakeGuild()
+    rule_data = AutoModRuleData(name="Broken", event_type="message_send", trigger_type="keyword", actions=[])
+    plan = RestorePlan(
+        backup_id="b1", scope=RestoreScope.AUTOMOD, remove_extra=False,
+        items=[PlanItem(kind=KIND_AUTOMOD, action=ACTION_CREATE, name="Broken", backup_obj=rule_data)],
+    )
+
+    result = run(restore_module.apply_plan(guild, plan))
+
+    assert result.total_created() == 0
+    assert len(result.errors) == 1
+
+
+def test_apply_plan_creates_webhook_in_matching_channel():
+    from utils.backup_core.models import KIND_WEBHOOK, WebhookData
+
+    guild = FakeGuild()
+    guild._channels.append(FakeChannel("releases", kind="text"))
+    webhook_data = WebhookData(name="GitHub", channel_name="releases")
+    plan = RestorePlan(
+        backup_id="b1", scope=RestoreScope.WEBHOOKS, remove_extra=False,
+        items=[PlanItem(kind=KIND_WEBHOOK, action=ACTION_CREATE, name="GitHub", backup_obj=webhook_data)],
+    )
+
+    result = run(restore_module.apply_plan(guild, plan))
+
+    assert result.created[KIND_WEBHOOK] == 1
+
+
+def test_apply_plan_webhook_reports_error_when_channel_missing():
+    from utils.backup_core.models import KIND_WEBHOOK, WebhookData
+
+    guild = FakeGuild()
+    webhook_data = WebhookData(name="GitHub", channel_name="does-not-exist")
+    plan = RestorePlan(
+        backup_id="b1", scope=RestoreScope.WEBHOOKS, remove_extra=False,
+        items=[PlanItem(kind=KIND_WEBHOOK, action=ACTION_CREATE, name="GitHub", backup_obj=webhook_data)],
+    )
+
+    result = run(restore_module.apply_plan(guild, plan))
+
+    assert result.total_created() == 0
+    assert len(result.errors) == 1
+    assert "does-not-exist" in result.errors[0]

@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, asdict
 from enum import Flag, auto
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # v3: добавлены automod_rules и webhooks (см. BackupData ниже)
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +209,104 @@ class GuildSettingsData:
 
 
 @dataclass
+class AutoModActionData:
+    """Одно действие AutoMod-правила (что делать при срабатывании)."""
+
+    type: str  # block_message | send_alert_message | timeout | block_member_interactions
+    channel_name: str | None = None  # для send_alert_message
+    duration_seconds: int | None = None  # для timeout
+    custom_message: str | None = None  # для block_message
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AutoModActionData":
+        return cls(
+            type=d.get("type", "block_message"),
+            channel_name=d.get("channel_name"),
+            duration_seconds=d.get("duration_seconds"),
+            custom_message=d.get("custom_message"),
+        )
+
+
+@dataclass
+class AutoModRuleData:
+    """Правило AutoMod. trigger_type определяет, какие из полей
+    keyword_filter/regex_patterns/presets/allow_list/mention_limit реально
+    задействованы — остальные у конкретного правила просто пустые/None,
+    как и в самом Discord API."""
+
+    name: str
+    event_type: str
+    trigger_type: str
+    keyword_filter: list[str] = field(default_factory=list)
+    regex_patterns: list[str] = field(default_factory=list)
+    presets: list[int] = field(default_factory=list)  # битовые позиции — см. AutoModPresets.to_array() в capture.py
+    allow_list: list[str] = field(default_factory=list)
+    mention_limit: int | None = None
+    mention_raid_protection: bool = False
+    enabled: bool = True
+    exempt_role_names: list[str] = field(default_factory=list)
+    exempt_channel_names: list[str] = field(default_factory=list)
+    actions: list[AutoModActionData] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "event_type": self.event_type,
+            "trigger_type": self.trigger_type,
+            "keyword_filter": self.keyword_filter,
+            "regex_patterns": self.regex_patterns,
+            "presets": self.presets,
+            "allow_list": self.allow_list,
+            "mention_limit": self.mention_limit,
+            "mention_raid_protection": self.mention_raid_protection,
+            "enabled": self.enabled,
+            "exempt_role_names": self.exempt_role_names,
+            "exempt_channel_names": self.exempt_channel_names,
+            "actions": [a.to_dict() for a in self.actions],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AutoModRuleData":
+        return cls(
+            name=d["name"],
+            event_type=d.get("event_type", "message_send"),
+            trigger_type=d.get("trigger_type", "keyword"),
+            keyword_filter=list(d.get("keyword_filter", [])),
+            regex_patterns=list(d.get("regex_patterns", [])),
+            presets=list(d.get("presets", [])),
+            allow_list=list(d.get("allow_list", [])),
+            mention_limit=d.get("mention_limit"),
+            mention_raid_protection=bool(d.get("mention_raid_protection", False)),
+            enabled=bool(d.get("enabled", True)),
+            exempt_role_names=list(d.get("exempt_role_names", [])),
+            exempt_channel_names=list(d.get("exempt_channel_names", [])),
+            actions=[AutoModActionData.from_dict(a) for a in d.get("actions", [])],
+        )
+
+
+@dataclass
+class WebhookData:
+    """Структурный вебхук, привязанный к каналу (например, для приёма
+    уведомлений от GitHub/других сервисов). Токен НЕ сохраняется — Discord
+    выдаёт новый токен при пересоздании вебхука, старый восстановить нельзя
+    в принципе, так что в бэкапе хранится только то, что можно восстановить."""
+
+    name: str
+    channel_name: str
+    avatar_b64: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "WebhookData":
+        return cls(name=d["name"], channel_name=d["channel_name"], avatar_b64=d.get("avatar_b64"))
+
+
+@dataclass
 class BackupMetadata:
     backup_id: str
     created_at: str  # ISO-8601, UTC
@@ -247,7 +345,9 @@ class BackupData:
     emojis: list[EmojiData] = field(default_factory=list)
     stickers: list[StickerData] = field(default_factory=list)
     guild_settings: GuildSettingsData | None = None
-    # Зарезервировано под будущие секции (вебхуки, баны, AutoMod и т.п.),
+    automod_rules: list[AutoModRuleData] = field(default_factory=list)  # с v3 схемы
+    webhooks: list[WebhookData] = field(default_factory=list)  # с v3 схемы
+    # Зарезервировано под будущие секции (баны, приглашения и т.п.),
     # которые не хотим заводить отдельной миграцией формата прямо сейчас.
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -260,6 +360,8 @@ class BackupData:
             "emojis": [e.to_dict() for e in self.emojis],
             "stickers": [s.to_dict() for s in self.stickers],
             "guild_settings": self.guild_settings.to_dict() if self.guild_settings else None,
+            "automod_rules": [r.to_dict() for r in self.automod_rules],
+            "webhooks": [w.to_dict() for w in self.webhooks],
             "extra": self.extra,
         }
 
@@ -274,6 +376,10 @@ class BackupData:
             emojis=[EmojiData.from_dict(e) for e in d.get("emojis", [])],
             stickers=[StickerData.from_dict(s) for s in d.get("stickers", [])],
             guild_settings=GuildSettingsData.from_dict(gs) if gs else None,
+            # .get(..., []) — в бэкапах со старой схемой (v2 и ниже) этих секций
+            # просто не было, читаем как пустые списки, а не падаем с KeyError.
+            automod_rules=[AutoModRuleData.from_dict(r) for r in d.get("automod_rules", [])],
+            webhooks=[WebhookData.from_dict(w) for w in d.get("webhooks", [])],
             extra=dict(d.get("extra", {})),
         )
 
@@ -294,10 +400,22 @@ class RestoreScope(Flag):
     EMOJIS = auto()
     STICKERS = auto()
     GUILD_SETTINGS = auto()
+    AUTOMOD = auto()
+    WEBHOOKS = auto()
 
     @classmethod
     def all(cls) -> "RestoreScope":
-        return cls.ROLES | cls.CATEGORIES | cls.CHANNELS | cls.PERMISSIONS | cls.EMOJIS | cls.STICKERS | cls.GUILD_SETTINGS
+        return (
+            cls.ROLES
+            | cls.CATEGORIES
+            | cls.CHANNELS
+            | cls.PERMISSIONS
+            | cls.EMOJIS
+            | cls.STICKERS
+            | cls.GUILD_SETTINGS
+            | cls.AUTOMOD
+            | cls.WEBHOOKS
+        )
 
     @classmethod
     def from_keyword(cls, keyword: str) -> "RestoreScope":
@@ -322,6 +440,8 @@ KIND_CHANNEL = "channel"
 KIND_EMOJI = "emoji"
 KIND_STICKER = "sticker"
 KIND_GUILD_SETTINGS = "guild_settings"
+KIND_AUTOMOD = "automod_rule"
+KIND_WEBHOOK = "webhook"
 
 ACTION_CREATE = "create"
 ACTION_UPDATE = "update"

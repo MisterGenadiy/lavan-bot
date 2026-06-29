@@ -76,6 +76,7 @@ class LavanBot(commands.Bot):
             "cogs.antilink",
             "cogs.antiraid",
             "cogs.verification",
+            "cogs.auditwatch",
             "cogs.backup",
             "cogs.slash",
             "cogs.help",
