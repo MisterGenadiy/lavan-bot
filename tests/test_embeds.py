@@ -55,3 +55,21 @@ def test_build_restore_plan_embed_hides_remove_field_value_when_remove_extra_fal
     field_names = [f.name for f in embed.fields]
     assert any("останется" in name for name in field_names)
     assert not any(name.startswith("🔴 Удалить") for name in field_names)
+
+
+def test_build_backup_action_log_embed_truncates_long_description():
+    from utils.embeds import build_backup_action_log_embed, _EMBED_DESCRIPTION_LIMIT
+
+    long_description = "x" * 10000
+    embed = build_backup_action_log_embed("load", "TestUser#0001", long_description)
+
+    assert len(embed.description) <= _EMBED_DESCRIPTION_LIMIT
+
+
+def test_build_backup_action_log_embed_keeps_short_description_intact():
+    from utils.embeds import build_backup_action_log_embed
+
+    embed = build_backup_action_log_embed("save", "TestUser#0001", "Создан бэкап `abc-123`.")
+
+    assert embed.description == "Создан бэкап `abc-123`."
+    assert "TestUser#0001" in embed.footer.text

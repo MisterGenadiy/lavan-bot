@@ -104,14 +104,23 @@ def format_missing_permissions_warning(missing: list[str]) -> str:
     )
 
 
+_EMBED_DESCRIPTION_LIMIT = 4096  # лимит Discord на длину embed.description
+
+
 def build_backup_action_log_embed(action: str, user, description: str) -> discord.Embed:
     """Запись для mod-log-канала о действии с бэкапом (/save, /load, /rollback
     и их префиксные аналоги) — кто и когда трогал структуру сервера через
-    бэкап, важно для аудита независимо от того, как прошла сама операция."""
+    бэкап, важно для аудита независимо от того, как прошла сама операция.
+
+    Сейчас description всегда короткий (фиксированный набор счётчиков), но
+    усечение добавлено на будущее — если в описание когда-нибудь попадёт более
+    длинный текст (например, полный список ошибок), это не должно ронять
+    отправку embed'а с Invalid Form Body, как уже случалось с полем плана
+    восстановления (см. _format_items выше)."""
     icons = {"save": "💾", "load": "♻️", "rollback": "⏪", "clone": "🧬"}
     embed = discord.Embed(
         title=f"{icons.get(action, '💾')} Бэкап: {action}",
-        description=description,
+        description=_truncate(description, _EMBED_DESCRIPTION_LIMIT),
         color=discord.Color.blurple(),
     )
     embed.set_footer(text=f"Инициатор: {user}")

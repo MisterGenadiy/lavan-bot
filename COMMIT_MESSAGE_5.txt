@@ -1,0 +1,32 @@
+test+fix(backup): тесты на listener auditwatch, защита embed.description от лимита Discord
+
+## Тесты на listener AuditWatch (tests/test_auditwatch.py)
+Раньше были покрыты только чистые функции форматирования (_label_for,
+_format_target, _format_changes) — сам listener on_audit_log_entry_create
+(чтение настроек через bot.db, поиск канала, отправка embed'а, обработка
+ошибок) тестами не затрагивался. Добавлено 5 новых тестов через лёгкие
+фейки (_FakeBot/_FakeDB/_FakeGuildForAudit/_FakeChannelForAudit):
+- listener ничего не делает, если auditwatch выключен;
+- ничего не делает, если канал не настроен;
+- ничего не делает (не падает), если настроенный канал не найден
+  (например, был удалён);
+- отправляет embed, когда всё настроено корректно;
+- HTTPException при отправке (например, rate limit) проглатывается,
+  не падает наружу.
+
+## utils/embeds.py: build_backup_action_log_embed
+- embed.description теперь усекается до 4096 символов (лимит Discord) —
+  до этого защиты не было. Сейчас description всегда короткий (фиксированный
+  набор счётчиков), реального риска не было, но это та же категория бага,
+  что уже однажды ловили на build_restore_plan_embed (Invalid Form Body:
+  field value too long) — лучше подстраховаться сразу, чем чинить по факту,
+  если описание когда-нибудь станет длиннее.
+- Тесты: 2 новых в tests/test_embeds.py (усечение длинного текста,
+  сохранение короткого текста без изменений).
+
+## Итог
+91 тест (было 84), все проходят. Изменены: cogs/auditwatch.py (не менялся,
+только добавлены тесты), utils/embeds.py, tests/test_auditwatch.py,
+tests/test_embeds.py.
+
+BREAKING: нет.
