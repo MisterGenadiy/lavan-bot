@@ -42,6 +42,7 @@ __all__ = [
     "restore_with_safety",
     "resume_from_checkpoint",
     "list_checkpoints",
+    "discard_checkpoint",
     "restore_backup",
     "latest_emergency_backup_id",
     "find_duplicates",
@@ -182,3 +183,11 @@ def list_checkpoints(guild_id: int) -> list[dict]:
     (краш бота, перезапуск при деплое) и его можно продолжить командой
     /resume или L.backup resume."""
     return _cp_module.list_checkpoints(guild_id)
+
+
+def discard_checkpoint(guild_id: int, checkpoint_id: str) -> None:
+    """Удаляет чекпоинт БЕЗ применения оставшихся пунктов плана — для случаев,
+    когда проблему уже решили вручную и продолжать /resume не нужно.
+    Уже применённые пункты плана (роли/каналы, созданные до сбоя)
+    при этом не отменяются — это просто отмена ДАЛЬНЕЙШЕГО восстановления."""
+    _cp_module.delete(guild_id, checkpoint_id)

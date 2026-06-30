@@ -27,6 +27,7 @@ class Help(commands.Cog):
                 f"`{prefix}antilink on|off [действие] [длительность_мута_сек]`\n"
                 f"`{prefix}antimention on|off [лимит] [действие] [мут_сек]`\n"
                 f"`{prefix}antiraid on|off [лимит] [интервал] [действие]`\n"
+                f"`{prefix}auditwatch on|off [#канал]` — дублировать аудит-лог сервера в канал\n"
                 f"`{prefix}verification on|off [@роль_до] [@роль_после] [таймаут_мин]`\n"
                 f"`{prefix}verification-channel <#канал>`\n"
                 f"`{prefix}verification-post` — отправить кнопку подтверждения\n"
@@ -67,10 +68,13 @@ class Help(commands.Cog):
                 f"`{prefix}backup restore [область] [safe|strict]` — восстановить из бэкапа "
                 "(показывает план изменений и требует подтверждения; область: all/roles/channels/categories/permissions)\n"
                 f"`{prefix}backup rollback [id]` — откатиться к авто-бэкапу перед последним restore\n"
+                f"`{prefix}backup resume [id]` — продолжить восстановление, прерванное перезапуском бота\n"
+                f"`{prefix}backup diff <id1> <id2>` — сравнить два бэкапа между собой\n"
                 f"`{prefix}backup info` — информация о последнем бэкапе\n"
                 f"`{prefix}backup list` — список всех сохранённых бэкапов\n"
                 f"`{prefix}backup duplicates` — найти роли/каналы с одинаковыми именами\n"
-                "Также доступно как слэш-команды: `/save`, `/load`, `/rollback`, `/backups`, `/find-duplicates`."
+                "Также доступно как слэш-команды: `/save`, `/load`, `/rollback`, `/resume`, "
+                "`/backups`, `/backup-diff`, `/find-duplicates`, `/clone-template` (только владелец бота)."
             ),
             inline=False,
         )

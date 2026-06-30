@@ -62,7 +62,8 @@ class Backup(commands.Cog):
             await self._diff(ctx, args[0], args[1])
         elif action == "resume":
             cp_id = args[0] if args else None
-            await self._resume(ctx, cp_id)
+            discard = len(args) > 1 and args[1].lower() in ("discard", "отменить", "cancel")
+            await self._resume(ctx, cp_id, discard=discard)
         else:
             await ctx.send("Использование: `L.backup save|restore|rollback|info|list|duplicates|diff|resume`")
 
@@ -124,7 +125,7 @@ class Backup(commands.Cog):
             f"(сопоставление идёт по имени, не по ID):\n{text}"
         )
 
-    async def _resume(self, ctx: commands.Context, checkpoint_id: str | None):
+    async def _resume(self, ctx: commands.Context, checkpoint_id: str | None, *, discard: bool = False):
         checkpoints = backup_core.list_checkpoints(ctx.guild.id)
         if not checkpoints:
             return await ctx.send("✅ Незавершённых восстановлений нет.")
@@ -136,6 +137,13 @@ class Backup(commands.Cog):
             else:
                 lines = [f"`{c['checkpoint_id']}` — прогресс {c['progress']}, бэкап `{c['backup_id']}`" for c in checkpoints]
                 return await ctx.send("Найдено несколько чекпоинтов — укажите ID:\n" + "\n".join(lines))
+
+        if discard:
+            backup_core.discard_checkpoint(ctx.guild.id, cp_id)
+            return await ctx.send(
+                f"🗑️ Чекпоинт `{cp_id}` отменён — оставшиеся пункты плана применены не будут "
+                "(уже сделанное до сбоя НЕ откатывается)."
+            )
 
         status = await ctx.send(f"⏳ Возобновляю восстановление с чекпоинта `{cp_id}`...")
         try:

@@ -1,0 +1,35 @@
+fix(backup): закрыта утечка приватности в /clone-template, добавлен discard для resume
+
+## Security fix
+- /clone-template был защищён @owner_check() на уровне самой команды, но
+  Discord вызывает функцию автодополнения (clone_backup_id_autocomplete)
+  НЕЗАВИСИМО от app_commands-проверок команды. Любой пользователь, начавший
+  вводить /clone-template и подставив произвольный ID сервера в первое поле,
+  видел бы в подсказках имена и даты создания бэкапов ЧУЖИХ серверов, где
+  работает бот — утечка приватности (не структуры сервера, но факта
+  существования бэкапа, его даты и имени гильдии).
+- Исправлено: owner-проверка (interaction.client.is_owner) теперь дублируется
+  непосредственно внутри autocomplete-функции, а не только на самой команде.
+
+## L.help / cogs/help.py
+- Команда auditwatch отсутствовала в встроенной справке — добавлена в секцию
+  "⚙️ Настройки".
+- Секция "💾 Бэкап" дополнена commands resume и diff, упомянуты все новые
+  слэш-команды (/resume, /backup-diff, /clone-template).
+
+## Отмена незавершённого восстановления (discard checkpoint)
+- backup_core.discard_checkpoint(guild_id, checkpoint_id) — новая функция
+  публичного API, удаляет чекпоинт БЕЗ применения оставшихся пунктов плана.
+- /resume отменить:True и L.backup resume <id> discard — для случаев, когда
+  проблему уже решили вручную и продолжать restore не нужно. Уже применённые
+  до сбоя пункты НЕ откатываются — отменяется только применение остатка.
+- Тест: test_discard_checkpoint_via_public_api в tests/test_checkpoint.py
+  (итог: 84 теста, было 83).
+
+## README.md
+- Обновлены таблицы команд (resume с discard-опцией) и раздел "Примечания".
+
+Файлы: cogs/slash.py, cogs/backup.py, cogs/help.py, utils/backup_core/__init__.py,
+tests/test_checkpoint.py, README.md.
+
+BREAKING: нет.

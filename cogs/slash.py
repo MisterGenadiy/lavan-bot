@@ -116,7 +116,18 @@ async def clone_backup_id_autocomplete(interaction: discord.Interaction, current
     """Как backup_id_autocomplete, но читает бэкапы СЕРВЕРА-ИСТОЧНИКА, а не
     текущего — id_сервера_источника берём из уже введённого пользователем
     значения соседнего поля (interaction.namespace), доступного на лету,
-    пока он заполняет форму слэш-команды."""
+    пока он заполняет форму слэш-команды.
+
+    ВАЖНО: Discord вызывает функцию автодополнения независимо от того,
+    пройдёт ли пользователь app_commands.check() самой команды — проверка
+    @owner_check() на /clone-template не защищает автодополнение само по
+    себе. Без явной проверки здесь любой пользователь, начавший вводить
+    /clone-template и подставив произвольный ID сервера, увидел бы в
+    подсказках имена и даты бэкапов ЧУЖИХ серверов, где работает бот —
+    утечка приватности. Поэтому owner-проверка дублируется и тут."""
+    if not await interaction.client.is_owner(interaction.user):
+        return []
+
     raw_guild_id = getattr(interaction.namespace, "id_сервера_источника", None)
     if not raw_guild_id:
         return []
@@ -820,9 +831,12 @@ class SlashCommands(commands.Cog):
     @app_commands.command(
         name="resume", description="Продолжить восстановление, прерванное перезапуском бота"
     )
-    @app_commands.describe(чекпоинт="ID чекпоинта — оставьте пустым, чтобы выбрать единственный или последний")
+    @app_commands.describe(
+        чекпоинт="ID чекпоинта — оставьте пустым, чтобы выбрать единственный или последний",
+        отменить="Отменить чекпоинт БЕЗ применения оставшихся пунктов (если проблему уже решили вручную)",
+    )
     @mod_check()
-    async def resume_cmd(self, interaction: discord.Interaction, чекпоинт: str = None):
+    async def resume_cmd(self, interaction: discord.Interaction, чекпоинт: str = None, отменить: bool = False):
         checkpoints = backup_core.list_checkpoints(interaction.guild.id)
         if not checkpoints:
             return await interaction.response.send_message(
@@ -843,6 +857,14 @@ class SlashCommands(commands.Cog):
                     "Найдено несколько незавершённых чекпоинтов — укажите один явно:\n" + "\n".join(lines),
                     ephemeral=True,
                 )
+
+        if отменить:
+            backup_core.discard_checkpoint(interaction.guild.id, cp_id)
+            return await interaction.response.send_message(
+                f"🗑️ Чекпоинт `{cp_id}` отменён — оставшиеся пункты плана применены не будут "
+                "(уже сделанное до сбоя НЕ откатывается).",
+                ephemeral=True,
+            )
 
         await interaction.response.defer()
         try:

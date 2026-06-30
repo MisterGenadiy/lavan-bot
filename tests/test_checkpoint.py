@@ -149,3 +149,17 @@ def test_result_from_checkpoint_merges_previous_results(isolated_backup_dir):
     assert merged.created[KIND_ROLE] == 5
     assert merged.skipped_conflicts == 2
     assert merged.errors == ["err1"]
+
+
+def test_discard_checkpoint_via_public_api(isolated_backup_dir):
+    """backup_core.discard_checkpoint() удаляет чекпоинт без применения
+    оставшихся пунктов — используется командой /resume отменить:True."""
+    from utils import backup_core
+
+    guild_id = 8
+    plan = _make_plan(KIND_ROLE, KIND_ROLE)
+    cp_id = cp_module.create(guild_id, plan, emergency_backup_id=None)
+    assert len(backup_core.list_checkpoints(guild_id)) == 1
+
+    backup_core.discard_checkpoint(guild_id, cp_id)
+    assert backup_core.list_checkpoints(guild_id) == []
