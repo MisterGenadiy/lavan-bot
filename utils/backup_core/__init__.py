@@ -43,6 +43,7 @@ __all__ = [
     "resume_from_checkpoint",
     "list_checkpoints",
     "discard_checkpoint",
+    "prune_stale_checkpoints_all_guilds",
     "restore_backup",
     "latest_emergency_backup_id",
     "find_duplicates",
@@ -191,3 +192,10 @@ def discard_checkpoint(guild_id: int, checkpoint_id: str) -> None:
     Уже применённые пункты плана (роли/каналы, созданные до сбоя)
     при этом не отменяются — это просто отмена ДАЛЬНЕЙШЕГО восстановления."""
     _cp_module.delete(guild_id, checkpoint_id)
+
+
+def prune_stale_checkpoints_all_guilds() -> int:
+    """Удаляет забытые чекпоинты (старше недели) для всех серверов сразу —
+    вызывается один раз при старте бота (см. bot.py: on_ready). Возвращает
+    количество удалённых файлов, для лога."""
+    return _cp_module.prune_stale_checkpoints_all_guilds()

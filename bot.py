@@ -19,6 +19,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 from cogs.verification import VerifyView
+from utils import backup_core
 from utils.database import Database
 
 load_dotenv()
@@ -63,6 +64,7 @@ class LavanBot(commands.Bot):
 
         super().__init__(command_prefix=get_prefix, intents=intents, help_command=None)
         self.db = db
+        self._startup_cleanup_done = False  # on_ready может сработать повторно при reconnect
         # Глобальный обработчик ошибок слэш-команд — без него Forbidden/HTTPException
         # из любой команды просто "проглатывается" в лог, а пользователь в Discord
         # не получает никакого ответа (интеракция выглядит как зависшая/проваленная).
@@ -101,6 +103,22 @@ class LavanBot(commands.Bot):
                 type=discord.ActivityType.watching, name="за безопасностью сервера"
             )
         )
+        if not self._startup_cleanup_done:
+            self._startup_cleanup_done = True
+            # Чекпоинты восстановления, про которые забыли (никогда не вызвали
+            # /resume), иначе копились бы на диске бесконечно — у самих бэкапов
+            # уже есть ретеншн (storage.prune_old_backups), у чекпоинтов до этого
+            # момента нет. Запускается через bot.loop, чтобы не задерживать сам
+            # on_ready, если на диске скопилось много серверов/файлов.
+            async def _cleanup():
+                try:
+                    removed = await asyncio.to_thread(backup_core.prune_stale_checkpoints_all_guilds)
+                    if removed:
+                        log.info("Удалено забытых чекпоинтов восстановления: %d", removed)
+                except Exception:
+                    log.exception("Не удалось очистить устаревшие чекпоинты восстановления")
+
+            asyncio.create_task(_cleanup())
 
     async def on_resumed(self):
         # discord.py сам переподключается при разрывах гейтвея; здесь только

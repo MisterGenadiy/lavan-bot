@@ -164,6 +164,58 @@ def list_checkpoints(guild_id: int) -> list[dict]:
     return result
 
 
+# Если /resume никогда не вызвали (например, администратор забыл про прерванное
+# восстановление или решил всё переделать через /load заново), чекпоинт иначе
+# остался бы на диске навсегда — в отличие от самих бэкапов, у которых уже есть
+# ретеншн (storage.prune_old_backups). max_age здесь намеренно щедрый: неделя —
+# не цель удалить чекпоинт быстро, а просто не дать действительно забытым файлам
+# копиться бесконечно.
+STALE_CHECKPOINT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
+
+
+def prune_stale_checkpoints(guild_id: int, *, max_age_seconds: int = STALE_CHECKPOINT_MAX_AGE_SECONDS) -> int:
+    """Удаляет чекпоинты сервера старше max_age_seconds. Возвращает количество
+    удалённых файлов. Безопасно вызывать многократно — если чекпоинтов нет
+    или все свежие, просто ничего не делает."""
+    directory = _checkpoints_dir(guild_id)
+    if not os.path.isdir(directory):
+        return 0
+    now = time.time()
+    removed = 0
+    for fn in os.listdir(directory):
+        if not fn.endswith(".json"):
+            continue
+        path = os.path.join(directory, fn)
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            created_at = data.get("created_at", now)
+        except (OSError, ValueError, KeyError):
+            created_at = 0  # повреждённый/нечитаемый файл — тоже считаем устаревшим и убираем
+        if now - created_at > max_age_seconds:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def prune_stale_checkpoints_all_guilds(*, max_age_seconds: int = STALE_CHECKPOINT_MAX_AGE_SECONDS) -> int:
+    """То же самое, но сразу для всех серверов, у которых вообще есть папка
+    бэкапов на диске — удобно вызывать один раз при старте бота (см. bot.py:
+    on_ready), не выбирая список гильдий вручную."""
+    if not os.path.isdir(storage.BACKUP_DIR):
+        return 0
+    total_removed = 0
+    for entry in os.listdir(storage.BACKUP_DIR):
+        full_path = os.path.join(storage.BACKUP_DIR, entry)
+        if not os.path.isdir(full_path) or not entry.isdigit():
+            continue  # пропускаем легаси-файлы вида {guild_id}.json лежащие рядом, не папки
+        total_removed += prune_stale_checkpoints(int(entry), max_age_seconds=max_age_seconds)
+    return total_removed
+
+
 def to_plan(data: dict) -> RestorePlan:
     items = [_deserialize_item(d) for d in data["items"]]
     return RestorePlan(

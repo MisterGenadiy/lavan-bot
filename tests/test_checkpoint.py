@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 
 import pytest
 
@@ -163,3 +164,56 @@ def test_discard_checkpoint_via_public_api(isolated_backup_dir):
 
     backup_core.discard_checkpoint(guild_id, cp_id)
     assert backup_core.list_checkpoints(guild_id) == []
+
+
+def test_prune_stale_checkpoints_removes_old_keeps_fresh(isolated_backup_dir):
+    guild_id = 9
+    plan = _make_plan(KIND_ROLE)
+
+    old_id = cp_module.create(guild_id, plan, emergency_backup_id=None)
+    fresh_id = cp_module.create(guild_id, plan, emergency_backup_id=None)
+
+    # "состариваем" один из чекпоинтов вручную, не дожидаясь реальной недели
+    old_data = cp_module.load(guild_id, old_id)
+    old_data["created_at"] = time.time() - (8 * 24 * 60 * 60)  # 8 дней назад
+    cp_module._write(guild_id, old_id, old_data)
+
+    removed = cp_module.prune_stale_checkpoints(guild_id, max_age_seconds=7 * 24 * 60 * 60)
+
+    assert removed == 1
+    remaining_ids = {c["checkpoint_id"] for c in cp_module.list_checkpoints(guild_id)}
+    assert remaining_ids == {fresh_id}
+
+
+def test_prune_stale_checkpoints_noop_when_all_fresh(isolated_backup_dir):
+    guild_id = 10
+    plan = _make_plan(KIND_ROLE)
+    cp_module.create(guild_id, plan, emergency_backup_id=None)
+
+    removed = cp_module.prune_stale_checkpoints(guild_id)
+
+    assert removed == 0
+    assert len(cp_module.list_checkpoints(guild_id)) == 1
+
+
+def test_prune_stale_checkpoints_handles_missing_directory_gracefully(isolated_backup_dir):
+    # Сервер вообще без чекпоинтов — не должно падать
+    assert cp_module.prune_stale_checkpoints(99999) == 0
+
+
+def test_prune_stale_checkpoints_all_guilds_covers_multiple_guilds(isolated_backup_dir):
+    plan = _make_plan(KIND_ROLE)
+    guild_ids = [101, 102, 103]
+    old_ids = []
+    for gid in guild_ids:
+        cp_id = cp_module.create(gid, plan, emergency_backup_id=None)
+        data = cp_module.load(gid, cp_id)
+        data["created_at"] = time.time() - (8 * 24 * 60 * 60)
+        cp_module._write(gid, cp_id, data)
+        old_ids.append((gid, cp_id))
+
+    total_removed = cp_module.prune_stale_checkpoints_all_guilds()
+
+    assert total_removed == 3
+    for gid, _ in old_ids:
+        assert cp_module.list_checkpoints(gid) == []
