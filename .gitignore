@@ -2,16 +2,28 @@
 data.sqlite3*
 __pycache__/
 *.pyc
-backups/**/*.json
-backups/*.json
-.venv/
-logs/*
-backups/**/*.json.gz/
+*.pyo
+
+# Логи бота (logs/lavan-bot.log + ротированные копии .log.1, .log.2, ...)
 logs/
-*.sqlite3-wal
+
+# Бэкапы: json/gz-файлы в обоих форматах (старый плоский и новый по папкам)
+backups/*.json
+backups/**/*.json
+backups/**/*.json.gz
+# Чекпоинты — временные файлы, живут только во время восстановления
+backups/**/_checkpoints/
+
+# SQLite WAL/SHM-файлы (создаются автоматически при запущенном боте)
 *.sqlite3-shm
+*.sqlite3-wal
+
+# Виртуальное окружение
+.venv/
 venv/
 env/
+
+# IDE
 .idea/
 .vscode/
 *.swp
