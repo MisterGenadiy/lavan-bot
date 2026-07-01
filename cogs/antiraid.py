@@ -8,9 +8,15 @@ from collections import defaultdict, deque
 from datetime import timedelta
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from utils.moderation_utils import send_log
+
+# Записи об активности старше этого порога точно не нужны ни для подсчёта
+# всплесков (антирейд/антикраш работают в окне интервалов в секундах-минутах),
+# ни для антидубликата — используются только периодической чисткой ниже,
+# чтобы join_log/delete_log не росли бесконечно на долгоживущем процессе.
+_STALE_ACTIVITY_SECONDS = 3600
 
 
 class AntiRaid(commands.Cog):
@@ -20,6 +26,25 @@ class AntiRaid(commands.Cog):
         # счётчики удалений по (guild_id, actor_id)
         self.delete_log: dict[tuple[int, int], deque] = defaultdict(lambda: deque(maxlen=50))
         self.lockdown_active: set[int] = set()
+        self._cleanup_stale_activity.start()
+
+    def cog_unload(self):
+        self._cleanup_stale_activity.cancel()
+
+    @tasks.loop(minutes=15)
+    async def _cleanup_stale_activity(self):
+        """Убирает записи неактивных серверов/пользователей из join_log и
+        delete_log — без этого словари растут бесконечно, т.к. ключи
+        никогда не удалялись сами по себе (только добавлялись при событиях)."""
+        cutoff = time.time() - _STALE_ACTIVITY_SECONDS
+        for guild_id in [gid for gid, log in self.join_log.items() if not log or log[-1] < cutoff]:
+            del self.join_log[guild_id]
+        for key in [k for k, log in self.delete_log.items() if not log or log[-1] < cutoff]:
+            del self.delete_log[key]
+
+    @_cleanup_stale_activity.before_loop
+    async def _before_cleanup(self):
+        await self.bot.wait_until_ready()
 
     # ---------------- Анти-рейд (массовые вступления) ----------------
 
@@ -116,7 +141,7 @@ class AntiRaid(commands.Cog):
                 m for m in guild.members
                 if m.joined_at and m.joined_at.timestamp() >= cutoff and not m.bot
             ]
-            for m in recent_members:
+            for i, m in enumerate(recent_members):
                 try:
                     if action == "kick":
                         await m.kick(reason="Анти-рейд: массовое вступление")
@@ -124,6 +149,11 @@ class AntiRaid(commands.Cog):
                         await m.ban(reason="Анти-рейд: массовое вступление", delete_message_seconds=0)
                 except discord.Forbidden:
                     continue
+                # Небольшая пауза каждые 5 действий — на реальном крупном рейде
+                # (десятки-сотни вступлений разом) без неё легко упереться
+                # в rate limit Discord и часть кик/банов просто не применится.
+                if i % 5 == 4:
+                    await asyncio.sleep(1)
 
     @commands.command(name="unlock")
     async def unlock(self, ctx: commands.Context):
@@ -145,7 +175,9 @@ class AntiRaid(commands.Cog):
 
     # ---------------- Анти-краш (защита от "нюка" сервера) ----------------
 
-    async def _get_actor_from_audit(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
+    async def _get_actor_from_audit(
+        self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int
+    ) -> discord.Member | discord.User | None:
         try:
             # Таймаут 5 сек: если Discord отвечает медленно или недоступен,
             # не хотим блокировать event loop на неопределённое время — лучше
@@ -158,7 +190,11 @@ class AntiRaid(commands.Cog):
             return None
         return None
 
-    async def _register_deletion(self, guild: discord.Guild, actor: discord.Member | None):
+    async def _register_deletion(self, guild: discord.Guild, actor: discord.Member | discord.User | None):
+        # ВАЖНО: entry.user из audit_logs() не гарантированно Member — если виновник
+        # не в кэше участников (например, уже вышел с сервера сразу после "нюка"),
+        # discord.py возвращает обычный discord.User. У User нет .ban() и нет
+        # .edit(roles=...), поэтому ниже нельзя полагаться на то, что actor — Member.
         if actor is None or actor.bot:
             return
         settings = self.bot.db.get_all_settings(guild.id)
@@ -179,20 +215,28 @@ class AntiRaid(commands.Cog):
         if len(recent) < settings["anticrash_threshold"]:
             return
 
-        # Виновник найден — снимаем опасные права и/или банним
+        # Виновник найден — снимаем опасные права и/или банним.
+        # guild.ban() (а не actor.ban()) принимает любой discord.abc.Snowflake,
+        # поэтому работает одинаково и для Member, и для "оторвавшегося" User.
         try:
-            await actor.ban(
+            await guild.ban(
+                actor,
                 reason="Анти-краш: массовое удаление каналов/ролей (подозрение на нюк)",
                 delete_message_seconds=0,
             )
             result = "забанен"
         except discord.Forbidden:
-            try:
-                # Если бан невозможен — пытаемся снять все роли
-                await actor.edit(roles=[], reason="Анти-краш: подозрение на нюк сервера")
-                result = "роли сняты (бан невозможен из-за прав)"
-            except discord.Forbidden:
-                result = "не удалось наказать (недостаточно прав бота)"
+            # Снять роли можно только если это реально Member на сервере —
+            # пробуем получить его из кэша, если actor пришёл как plain User.
+            member = actor if isinstance(actor, discord.Member) else guild.get_member(actor.id)
+            if member is not None:
+                try:
+                    await member.edit(roles=[], reason="Анти-краш: подозрение на нюк сервера")
+                    result = "роли сняты (бан невозможен из-за прав)"
+                except discord.Forbidden:
+                    result = "не удалось наказать (недостаточно прав бота)"
+            else:
+                result = "не удалось наказать (пользователь не на сервере, а бан невозможен из-за прав)"
 
         await send_log(
             self.bot,

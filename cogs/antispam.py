@@ -11,9 +11,14 @@ import time
 from collections import defaultdict, deque
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from utils.moderation_utils import add_warn_and_escalate, apply_punishment, send_log
+
+# Записи об активности старше этого порога точно не нужны ни для подсчёта
+# антиспама (окно antispam_interval — секунды), ни для антидубликата —
+# используются только периодической чисткой ниже.
+_STALE_ACTIVITY_SECONDS = 3600
 
 
 class AntiSpam(commands.Cog):
@@ -24,6 +29,27 @@ class AntiSpam(commands.Cog):
         # Небольшой кулдаун, чтобы не наказывать дважды подряд за один и тот же всплеск
         self.recent_actions: dict[tuple[int, int], float] = {}
         self.recent_mention_actions: dict[tuple[int, int], float] = {}
+        self._cleanup_stale_activity.start()
+
+    def cog_unload(self):
+        self._cleanup_stale_activity.cancel()
+
+    @tasks.loop(minutes=15)
+    async def _cleanup_stale_activity(self):
+        """Убирает записи о неактивных пользователях из message_log/recent_actions/
+        recent_mention_actions — без этого словари растут бесконечно на долгоживущем
+        процессе, т.к. ключи (guild_id, user_id) никогда не удалялись сами по себе."""
+        cutoff = time.time() - _STALE_ACTIVITY_SECONDS
+        for key in [k for k, log in self.message_log.items() if not log or log[-1] < cutoff]:
+            del self.message_log[key]
+        for key in [k for k, ts in self.recent_actions.items() if ts < cutoff]:
+            del self.recent_actions[key]
+        for key in [k for k, ts in self.recent_mention_actions.items() if ts < cutoff]:
+            del self.recent_mention_actions[key]
+
+    @_cleanup_stale_activity.before_loop
+    async def _before_cleanup(self):
+        await self.bot.wait_until_ready()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
