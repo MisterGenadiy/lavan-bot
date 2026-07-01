@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import discord
 
-from cogs.auditwatch import AuditWatch, _format_changes, _format_target, _label_for
+from cogs.auditwatch import AuditWatch, _actor_icon_url, _format_changes, _format_target, _label_for
 
 
 def test_label_for_known_action():
@@ -40,6 +40,30 @@ def test_format_changes_limits_to_four_fields_and_shows_arrow():
 def test_format_changes_handles_missing_before_after_gracefully():
     entry = SimpleNamespace(before=None, after=None)
     assert _format_changes(entry) == ""
+
+
+# ---------------------------------------------------------------------------
+# _actor_icon_url — безопасная замена однострочника с 'and', который падал
+# на discord.Object (заглушка пользователя вне кэша, нет display_avatar)
+# ---------------------------------------------------------------------------
+
+def test_actor_icon_url_returns_url_when_user_has_avatar():
+    avatar = SimpleNamespace(url="https://cdn.discord.com/avatar.png")
+    actor = SimpleNamespace(display_avatar=avatar)
+    assert _actor_icon_url(actor) == "https://cdn.discord.com/avatar.png"
+
+
+def test_actor_icon_url_returns_none_for_discord_object_placeholder():
+    """discord.Object — заглушка для пользователей вне кэша, у неё нет
+    display_avatar. Именно такой actor мог прийти из audit log и ронял бот
+    при обращении через старый однострочник с 'and'."""
+    actor = discord.Object(id=123)
+    assert not hasattr(actor, "display_avatar")
+    assert _actor_icon_url(actor) is None  # не должно падать с AttributeError
+
+
+def test_actor_icon_url_returns_none_when_actor_is_none():
+    assert _actor_icon_url(None) is None
 
 
 # ---------------------------------------------------------------------------

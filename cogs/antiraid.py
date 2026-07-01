@@ -2,6 +2,7 @@
 Анти-краш: следит за журналом аудита на массовое удаление каналов/ролей/
 вебхуков (типичный признак "нюка" сервера) и блокирует виновника."""
 
+import asyncio
 import time
 from collections import defaultdict, deque
 from datetime import timedelta
@@ -146,10 +147,14 @@ class AntiRaid(commands.Cog):
 
     async def _get_actor_from_audit(self, guild: discord.Guild, action: discord.AuditLogAction, target_id: int):
         try:
-            async for entry in guild.audit_logs(limit=5, action=action):
-                if entry.target and entry.target.id == target_id:
-                    return entry.user
-        except discord.Forbidden:
+            # Таймаут 5 сек: если Discord отвечает медленно или недоступен,
+            # не хотим блокировать event loop на неопределённое время — лучше
+            # просто не найти актора, чем зависнуть в ожидании.
+            async with asyncio.timeout(5.0):
+                async for entry in guild.audit_logs(limit=5, action=action):
+                    if entry.target and entry.target.id == target_id:
+                        return entry.user
+        except (discord.Forbidden, asyncio.TimeoutError):
             return None
         return None
 
@@ -215,10 +220,11 @@ class AntiRaid(commands.Cog):
     async def on_webhooks_update(self, channel: discord.abc.GuildChannel):
         # Массовое создание вебхуков часто используется для спам-рейдов
         try:
-            async for entry in channel.guild.audit_logs(limit=3, action=discord.AuditLogAction.webhook_create):
-                await self._register_deletion(channel.guild, entry.user)
-                break
-        except discord.Forbidden:
+            async with asyncio.timeout(5.0):
+                async for entry in channel.guild.audit_logs(limit=3, action=discord.AuditLogAction.webhook_create):
+                    await self._register_deletion(channel.guild, entry.user)
+                    break
+        except (discord.Forbidden, asyncio.TimeoutError):
             pass
 
 

@@ -101,6 +101,17 @@ def _format_changes(entry: discord.AuditLogEntry) -> str:
     return "\n".join(lines)
 
 
+def _actor_icon_url(actor) -> str | None:
+    """Безопасно получает URL аватара актора аудит-лога.
+    actor может быть: discord.Member / discord.User (есть display_avatar),
+    discord.Object (заглушка для пользователей вне кэша — нет display_avatar),
+    или None (Discord не прислал актора вовсе)."""
+    avatar = getattr(actor, "display_avatar", None)
+    if avatar is None:
+        return None
+    return getattr(avatar, "url", None)
+
+
 def _build_entry_embed(entry: discord.AuditLogEntry) -> discord.Embed:
     embed = discord.Embed(
         title=_label_for(entry.action),
@@ -108,7 +119,10 @@ def _build_entry_embed(entry: discord.AuditLogEntry) -> discord.Embed:
         timestamp=entry.created_at,
     )
     actor = entry.user
-    embed.set_author(name=str(actor) if actor else "Неизвестно", icon_url=getattr(actor, "display_avatar", None) and actor.display_avatar.url)
+    embed.set_author(
+        name=str(actor) if actor else "Неизвестно",
+        icon_url=_actor_icon_url(actor),
+    )
     embed.add_field(name="Цель", value=_format_target(entry.target), inline=False)
     changes = _format_changes(entry)
     if changes:

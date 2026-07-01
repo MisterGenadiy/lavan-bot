@@ -1,0 +1,40 @@
+fix: actor_icon_url в auditwatch + timeout для audit_logs в antiraid
+
+## cogs/auditwatch.py: _actor_icon_url (баг)
+Старый код:
+  icon_url=getattr(actor, "display_avatar", None) and actor.display_avatar.url
+
+Если Discord присылает actor как discord.Object (заглушка для пользователей
+вне кэша), у него нет атрибута display_avatar. Оператор 'and' с getattr
+возвращает None корректно в большинстве случаев, но выражение сбивает с
+толку и в редких случаях (если реализация discord.py изменится) может
+падать с AttributeError. Заменено чистым хелпером _actor_icon_url(actor):
+  - если actor is None — None
+  - если у actor нет display_avatar (discord.Object) — None
+  - если есть — actor.display_avatar.url
+
+Тесты: 3 новых в tests/test_auditwatch.py (с avatar, discord.Object, None).
+
+## cogs/antiraid.py: asyncio.timeout(5.0) для audit_logs (зависание)
+guild.audit_logs() — сетевой вызов к Discord API. Если Discord отвечает
+медленно или временно недоступен, итератор мог зависнуть на неопределённое
+время и заблокировать event loop бота (все остальные команды, антиспам и
+т.д. переставали реагировать на вход). Добавлен asyncio.timeout(5.0) для
+обоих вызовов: _get_actor_from_audit() и on_webhooks_update(). При таймауте
+актор просто считается неизвестным — anti-crash продолжает работу, просто
+не банит конкретного пользователя за это конкретное событие.
+
+## Что проверялось и не потребовало исправлений
+- settings["key"] подписки в antispam/antiraid: get_all_settings() всегда
+  делает {**DEFAULT_SETTINGS, **data}, все ключи гарантированно присутствуют.
+- backup_id_autocomplete без is_owner: намеренно — используется командами
+  /load, /rollback, /backup-diff, доступными модераторам своего сервера
+  (в отличие от clone_backup_id_autocomplete, которая читает бэкапы ЧУЖИХ
+  серверов и уже защищена).
+- KeyError в get_all_settings: нет — см. выше.
+
+## Итог
+98 тестов (было 95), все проходят. Файлы: cogs/auditwatch.py, cogs/antiraid.py,
+tests/test_auditwatch.py.
+
+BREAKING: нет.
